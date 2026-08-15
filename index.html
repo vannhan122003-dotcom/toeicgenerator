@@ -190,17 +190,24 @@
         <div class="field-group" id="pastePanel" style="display:none">
             <div class="field-label"><i class="fa-solid fa-paste"></i> Paste Your Content</div>
             <div class="field-hint">Paste real TOEIC questions/passages below for each part you're building. Messy copy-paste is fine (line breaks, dashes as blanks) &mdash; the AI cleans it up. It will <b>not</b> rewrite your content, only format and solve it.</div>
+
+            <div id="uploadMdBox" class="paste-box" style="border:1.5px dashed var(--border);border-radius:10px;padding:16px;background:#fafcfe;">
+                <div class="paste-label"><i class="fa-solid fa-file-arrow-up"></i> Upload a prepared full test <small>(.md/.txt with Part 5/6/7 + an answer key &mdash; auto-fills the three boxes below. If an answer key is found, the AI <b>skips solving entirely</b> and only formats &amp; writes explanations &mdash; the cheapest possible run.)</small></div>
+                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
+                <div id="mdUploadStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:8px;line-height:1.5;"></div>
+            </div>
+
             <div id="pasteBox5" class="paste-box">
                 <div class="paste-label">Part 5 &mdash; Incomplete Sentences <small>(paste numbered items with A/B/C/D options)</small></div>
-                <textarea id="pasteText5" class="paste-area" spellcheck="false" placeholder="1. Lonan Imports will work ______ with any distributor.&#10;(A) directly  (B) directs  (C) directed  (D) directness&#10;&#10;2. ..."></textarea>
+                <textarea id="pasteText5" class="paste-area" spellcheck="false" placeholder="1. Lonan Imports will work ______ with any distributor.&#10;(A) directly  (B) directs  (C) directed  (D) directness&#10;&#10;2. ..." oninput="KNOWN_ANSWERS['5']=null;"></textarea>
             </div>
             <div id="pasteBox6" class="paste-box">
                 <div class="paste-label">Part 6 &mdash; Text Completion <small>(paste texts with numbered blanks &amp; options)</small></div>
-                <textarea id="pasteText6" class="paste-area" spellcheck="false" placeholder="Paste each short text with its 4 numbered blanks and their (A)(B)(C)(D) options..."></textarea>
+                <textarea id="pasteText6" class="paste-area" spellcheck="false" placeholder="Paste each short text with its 4 numbered blanks and their (A)(B)(C)(D) options..." oninput="KNOWN_ANSWERS['6']=null;"></textarea>
             </div>
             <div id="pasteBox7" class="paste-box">
                 <div class="paste-label">Part 7 &mdash; Reading Comprehension <small>(paste passages followed by their questions)</small></div>
-                <textarea id="pasteText7" class="paste-area" spellcheck="false" placeholder="Paste each passage/document, then its comprehension questions with (A)(B)(C)(D) options..."></textarea>
+                <textarea id="pasteText7" class="paste-area" spellcheck="false" placeholder="Paste each passage/document, then its comprehension questions with (A)(B)(C)(D) options..." oninput="KNOWN_ANSWERS['7']=null;"></textarea>
             </div>
         </div>
 
@@ -1025,18 +1032,118 @@
 
     var MANUAL_TEXT = { '5': '', '6': '', '7': '' };
 
-    async function solvePart5Manual(level, startNum, raw) {
+    // Known-good answers extracted from an uploaded full-test .md file, keyed
+    // by part. When set (non-null array of letters, in pasted order), the
+    // solve*Manual functions below skip asking the AI to derive answers at
+    // all — they only format the content and write explanations that
+    // justify the already-verified answer. This is strictly cheaper and
+    // safer than normal manual mode (no answer-deriving reasoning, no risk
+    // of the AI flipping a correct answer).
+    var KNOWN_ANSWERS = { '5': null, '6': null, '7': null };
+
+    // Parses the exact .md template this tool (and its companion chat
+    // workflow) produces: "## PART 5 ..." / "## PART 6 ..." / "## PART 7 ..."
+    // section headers, followed by an "## ANSWER KEY" section with lines like
+    // "**Part 5:** 101-A, 102-C, ...". Deterministic string parsing only —
+    // no AI call, no cost, and it fails loudly if the headers aren't found
+    // rather than silently guessing.
+    function parseFullTestMD(md) {
+        md = String(md || '').replace(/\r\n?/g, '\n');
+        function headerIndex(re) { var m = re.exec(md); return m ? m.index : -1; }
+        var i5 = headerIndex(/^##\s*PART\s*5\b.*$/im);
+        var i6 = headerIndex(/^##\s*PART\s*6\b.*$/im);
+        var i7 = headerIndex(/^##\s*PART\s*7\b.*$/im);
+        var iKey = headerIndex(/^##\s*ANSWER\s*KEY\b.*$/im);
+        if (i5 < 0 || i6 < 0 || i7 < 0 || !(i5 < i6 && i6 < i7)) {
+            throw new Error('Could not find "## PART 5", "## PART 6" and "## PART 7" section headers in this file, in order.');
+        }
+        var end7 = (iKey >= 0 && iKey > i7) ? iKey : md.length;
+
+        function sectionBody(start, end) {
+            var chunk = md.slice(start, end);
+            return chunk.replace(/^##.*$/m, '').trim();
+        }
+
+        var known = { '5': [], '6': [], '7': [] };
+        if (iKey >= 0) {
+            var keyBlock = md.slice(iKey);
+            ['5', '6', '7'].forEach(function (p) {
+                var re = new RegExp('\\*\\*Part\\s*' + p + ':\\*\\*\\s*([^\\n]+)', 'i');
+                var m = re.exec(keyBlock);
+                if (!m) return;
+                var pairs = [];
+                m[1].split(',').forEach(function (piece) {
+                    var mm = /(\d+)\s*-\s*([A-D])/i.exec(piece);
+                    if (mm) pairs.push({ num: parseInt(mm[1], 10), letter: mm[2].toUpperCase() });
+                });
+                pairs.sort(function (a, b) { return a.num - b.num; });
+                known[p] = pairs.map(function (x) { return x.letter; });
+            });
+        }
+
+        return {
+            part5Raw: sectionBody(i5, i6),
+            part6Raw: sectionBody(i6, i7),
+            part7Raw: sectionBody(i7, end7),
+            known: known
+        };
+    }
+
+    function handleMdUpload(evt) {
+        var file = evt.target.files && evt.target.files[0];
+        var statusEl = document.getElementById('mdUploadStatus');
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function (e) {
+            try {
+                var parsed = parseFullTestMD(e.target.result);
+                document.getElementById('pasteText5').value = parsed.part5Raw;
+                document.getElementById('pasteText6').value = parsed.part6Raw;
+                document.getElementById('pasteText7').value = parsed.part7Raw;
+                KNOWN_ANSWERS['5'] = parsed.known['5'].length ? parsed.known['5'] : null;
+                KNOWN_ANSWERS['6'] = parsed.known['6'].length ? parsed.known['6'] : null;
+                KNOWN_ANSWERS['7'] = parsed.known['7'].length ? parsed.known['7'] : null;
+                var foundKey = KNOWN_ANSWERS['5'] || KNOWN_ANSWERS['6'] || KNOWN_ANSWERS['7'];
+                var counts = 'Part 5: ' + parsed.known['5'].length + ' answers · Part 6: ' + parsed.known['6'].length + ' · Part 7: ' + parsed.known['7'].length;
+                statusEl.innerHTML = foundKey
+                    ? '<i class="fa-solid fa-circle-check" style="color:#22c55e;"></i> Loaded <b>' + file.name + '</b>. Answer key found (' + counts + ') — the AI will only format and explain, not solve.'
+                    : '<i class="fa-solid fa-circle-exclamation" style="color:var(--amber-600);"></i> Loaded <b>' + file.name + '</b>, but no answer key section was found — the AI will solve as usual.';
+                if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
+                log('Uploaded "' + file.name + '" — paste boxes filled' + (foundKey ? ' with a verified answer key.' : '.'), 'ok');
+            } catch (err) {
+                statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> ' + err.message;
+                log('Upload error: ' + err.message, 'err');
+            }
+        };
+        reader.onerror = function () {
+            statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Could not read that file.';
+        };
+        reader.readAsText(file);
+    }
+
+    function buildAnswersFromKnown(startNum, letters) {
+        var out = {};
+        for (var i = 0; i < letters.length; i++) out['q' + (startNum + i)] = [letters[i]];
+        return out;
+    }
+
+    async function solvePart5Manual(level, startNum, raw, knownLetters) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 5: paste box is empty.');
+        var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
 
         var prompt =
-            'You are an expert TOEIC answer-key writer. Below is pasted TOEIC Reading PART 5 (Incomplete Sentences) content copied from a book or website, so its formatting may be messy (line breaks in the middle of sentences, blanks shown as runs of dashes or underscores, options labelled (A)(B)(C)(D) or A. B. C. D.). Do NOT write new questions. Faithfully convert EXACTLY what is pasted into clean interactive HTML, then solve every item with perfect accuracy.\n\n' +
+            'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 5 (Incomplete Sentences) content copied from a book or website, so its formatting may be messy (line breaks in the middle of sentences, blanks shown as runs of dashes or underscores, options labelled (A)(B)(C)(D) or A. B. C. D.). Do NOT write new questions.\n\n' +
+            (useKnown
+                ? 'The correct answer for every item is ALREADY VERIFIED and given below, in the SAME order the items appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean interactive HTML in the exact item order given, and (2) write a short Vietnamese explanation for each item justifying the GIVEN correct answer.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' items): ' + knownLetters.join(', ') + '\n\n'
+                : 'Faithfully convert EXACTLY what is pasted into clean interactive HTML, then solve every item with perfect accuracy.\n\n') +
             'PASTED CONTENT:\n"""\n' + body + '\n"""\n\n' +
             'RULES:\n' +
             '- Keep the sentences and all four options EXACTLY as written (fix only obvious copy-paste line-break splits within a sentence; do not reword).\n' +
-            '- Number the items sequentially starting at ' + startNum + ' in the order pasted, regardless of any numbers in the paste.\n' +
+            '- Number the items sequentially starting at ' + startNum + ' in the order pasted' + (useKnown ? ', matching 1-for-1 with the verified answers list above — do not skip, merge, or reorder any item; your item count MUST equal ' + knownLetters.length : ', regardless of any numbers in the paste') + '.\n' +
             '- Show each blank inline as <span class="p5-blank">_____</span>.\n' +
-            '- If an item is missing an option or is unreadable, skip it rather than invent content.\n\n' +
+            (useKnown ? '' : '- If an item is missing an option or is unreadable, skip it rather than invent content.\n') + '\n' +
             'HTML — exactly this structure per item:\n' +
             '<div class="mcq-item" data-q="' + startNum + '">\n' +
             '  <p class="mcq-stem"><b>' + startNum + '.</b> Sentence with <span class="p5-blank">_____</span> at the blank.</p>\n' +
@@ -1048,40 +1155,61 @@
             '  </div>\n' +
             '</div>\n' +
             'Increment the number, data-q and input name (q' + startNum + ', q' + (startNum + 1) + ', \u2026) for each item in order.\n\n' +
-            'ANSWERS: JSON object, one entry per item, value = array with the correct letter, e.g. {"q' + startNum + '": ["A"]}.\n' +
-            'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and why the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence.\n\n' +
-            'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
-            '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
-            '===GG_ANSWERS===\na JSON object only\n' +
-            '===GG_EXPLANATIONS===\na JSON object only\n' +
-            '===GG_END===\n\n' +
-            'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.';
+            (useKnown
+                ? 'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence.\n\n' +
+                  'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
+                  '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the EXPLANATIONS block only, escape any double quote as \\" and use \\n instead of a real newline.'
+                : 'ANSWERS: JSON object, one entry per item, value = array with the correct letter, e.g. {"q' + startNum + '": ["A"]}.\n' +
+                  'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and why the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence.\n\n' +
+                  'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
+                  '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
+                  '===GG_ANSWERS===\na JSON object only\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return htmlBlockComplete(t, '===GG_ITEMS===', '===GG_ANSWERS===', 300) &&
-                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS===');
+            return useKnown
+                ? htmlBlockComplete(t, '===GG_ITEMS===', '===GG_EXPLANATIONS===', 300)
+                : (htmlBlockComplete(t, '===GG_ITEMS===', '===GG_ANSWERS===', 300) &&
+                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text    = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
-        var items   = grabBlock(text, '===GG_ITEMS===', '===GG_ANSWERS===');
-        var answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var text = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
+        var items, answers, exps;
+        if (useKnown) {
+            items   = grabBlock(text, '===GG_ITEMS===', '===GG_EXPLANATIONS===');
+            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            answers = buildAnswersFromKnown(startNum, knownLetters);
+        } else {
+            items   = grabBlock(text, '===GG_ITEMS===', '===GG_ANSWERS===');
+            answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
+            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        }
 
         if (!items) throw new Error('Part 5: could not read any items from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 5: could not solve the answer key.');
         return { questions: items, answers: answers, explanations: exps };
     }
 
-    async function solvePart6Manual(level, startNum, raw) {
+    async function solvePart6Manual(level, startNum, raw, knownLetters) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 6: paste box is empty.');
+        var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
 
         var prompt =
-            'You are an expert TOEIC answer-key writer. Below is pasted TOEIC Reading PART 6 (Text Completion) content copied from a book or website, so formatting may be messy. Each text has numbered blanks; some blanks are single words/phrases with four options, and (in modern TOEIC) one blank per text is a "insert the best sentence" item with four full-sentence options. Do NOT write new texts. Convert EXACTLY what is pasted into clean interactive HTML, then solve every blank accurately.\n\n' +
+            'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 6 (Text Completion) content copied from a book or website, so formatting may be messy. Each text has numbered blanks; some blanks are single words/phrases with four options, and (in modern TOEIC) one blank per text is a "insert the best sentence" item with four full-sentence options. Do NOT write new texts.\n\n' +
+            (useKnown
+                ? 'The correct answer for every blank is ALREADY VERIFIED and given below, in the SAME order the blanks appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean interactive HTML in the exact blank order given, and (2) write a short Vietnamese explanation for each blank justifying the GIVEN correct answer.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' blanks): ' + knownLetters.join(', ') + '\n\n'
+                : 'Convert EXACTLY what is pasted into clean interactive HTML, then solve every blank accurately.\n\n') +
             'PASTED CONTENT:\n"""\n' + body + '\n"""\n\n' +
             'RULES:\n' +
             '- Keep the texts and all options EXACTLY as written; only fix obvious copy-paste line-break splits.\n' +
-            '- Number blanks sequentially starting at ' + startNum + ' in pasted order.\n' +
+            '- Number blanks sequentially starting at ' + startNum + ' in pasted order' + (useKnown ? ', matching 1-for-1 with the verified answers list above — your blank count MUST equal ' + knownLetters.length : '') + '.\n' +
             '- For a single word/phrase blank: render it inline as a <select> at the blank position.\n' +
             '- For a full-sentence-insertion blank: mark its position inline as plain "(N) ______" and render its four full-sentence options as radio buttons in a .p6-sentence-q block right after that text.\n' +
             '- Immediately before every inline <select>, place <span class="p6-qnum">N.</span> so its number is visible.\n' +
@@ -1093,24 +1221,40 @@
             '  <div class="p6-sentence-q"><p class="mcq-stem"><b>N.</b> Which sentence best completes the text?</p><div class="mcq-opts"><label><input type="radio" name="qN" value="A"> (A) sentence</label> ... four options ...</div></div>\n' +
             '</div>\n' +
             'Repeat for each text (data-text 1,2,3,\u2026). Every <select> option value MUST be only the letter A/B/C/D.\n\n' +
-            'ANSWERS: JSON object, one entry per blank, value = array with the correct letter.\n' +
-            'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the answer from the surrounding text; keep quoted English words in English.\n\n' +
-            'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
-            '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
-            '===GG_ANSWERS===\na JSON object only\n' +
-            '===GG_EXPLANATIONS===\na JSON object only\n' +
-            '===GG_END===\n\n' +
-            'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.';
+            (useKnown
+                ? 'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English.\n\n' +
+                  'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the EXPLANATIONS block only, escape any double quote as \\" and use \\n instead of a real newline.'
+                : 'ANSWERS: JSON object, one entry per blank, value = array with the correct letter.\n' +
+                  'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the answer from the surrounding text; keep quoted English words in English.\n\n' +
+                  'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
+                  '===GG_ANSWERS===\na JSON object only\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return htmlBlockComplete(t, '===GG_TEXTS===', '===GG_ANSWERS===', 300) &&
-                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS===');
+            return useKnown
+                ? htmlBlockComplete(t, '===GG_TEXTS===', '===GG_EXPLANATIONS===', 300)
+                : (htmlBlockComplete(t, '===GG_TEXTS===', '===GG_ANSWERS===', 300) &&
+                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text    = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
-        var texts   = grabBlock(text, '===GG_TEXTS===', '===GG_ANSWERS===');
-        var answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var text = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
+        var texts, answers, exps;
+        if (useKnown) {
+            texts   = grabBlock(text, '===GG_TEXTS===', '===GG_EXPLANATIONS===');
+            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            answers = buildAnswersFromKnown(startNum, knownLetters);
+        } else {
+            texts   = grabBlock(text, '===GG_TEXTS===', '===GG_ANSWERS===');
+            answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
+            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        }
 
         if (!texts) throw new Error('Part 6: could not read any texts from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 6: could not solve the answer key.');
@@ -1121,17 +1265,22 @@
     // solves. Returned as a single "single-passage" style group so the export's
     // Part 7 renderer shows it in the dual-pane layout without needing the
     // single/double/triple batching (which only matters for AI authoring).
-    async function solvePart7Manual(level, startNum, raw) {
+    async function solvePart7Manual(level, startNum, raw, knownLetters) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 7: paste box is empty.');
+        var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
 
         var prompt =
-            'You are an expert TOEIC answer-key writer. Below is pasted TOEIC Reading PART 7 (Reading Comprehension) content copied from a book or website \u2014 one or more reading passages/documents, each followed by its comprehension questions with four options. Do NOT write new passages or new questions. Convert EXACTLY what is pasted into clean HTML, then solve every question accurately.\n\n' +
+            'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 7 (Reading Comprehension) content copied from a book or website \u2014 one or more reading passages/documents, each followed by its comprehension questions with four options. Do NOT write new passages or new questions.\n\n' +
+            (useKnown
+                ? 'The correct answer for every question is ALREADY VERIFIED and given below, in the SAME order the questions appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean HTML in the exact question order given, and (2) write a Vietnamese explanation for each question justifying the GIVEN correct answer.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' questions): ' + knownLetters.join(', ') + '\n\n'
+                : 'Convert EXACTLY what is pasted into clean HTML, then solve every question accurately.\n\n') +
             'PASTED CONTENT:\n"""\n' + body + '\n"""\n\n' +
             'RULES:\n' +
             '- Keep passages, questions and options EXACTLY as written; only fix obvious copy-paste line-break splits.\n' +
             '- Group each passage (or linked set of documents) with its own questions.\n' +
-            '- Number questions sequentially starting at ' + startNum + ' in pasted order.\n' +
+            '- Number questions sequentially starting at ' + startNum + ' in pasted order' + (useKnown ? ', matching 1-for-1 with the verified answers list above — your question count MUST equal ' + knownLetters.length : '') + '.\n' +
             '- Separate the reading material from the questions: material goes in the PASSAGES block, questions in the QUESTIONS block.\n\n' +
             'PASSAGES HTML \u2014 wrap each passage/set:\n' +
             '<div class="toeic-set" data-set="1"><div class="toeic-doc"><div class="doc-label">Document type if identifiable, else "Passage"</div><div class="doc-body"><p>passage text\u2026</p></div></div></div>\n' +
@@ -1141,27 +1290,45 @@
             '  <div class="mcq-item" data-q="' + startNum + '"><p class="mcq-stem"><b>' + startNum + '.</b> question</p><div class="mcq-opts"><label><input type="radio" name="q' + startNum + '" value="A"> (A) option</label> ... four options ...</div></div>\n' +
             '  \u2026 more items \u2026\n</div>\n' +
             'Repeat the toeic-qset per set, matching data-set to the passages.\n\n' +
-            'ANSWERS: JSON object, one entry per question, value = array with the correct letter.\n' +
-            'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the answer; keep quoted English in English.\n\n' +
-            'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
-            '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
-            '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
-            '===GG_ANSWERS===\na JSON object only\n' +
-            '===GG_EXPLANATIONS===\na JSON object only\n' +
-            '===GG_END===\n\n' +
-            'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.';
+            (useKnown
+                ? 'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English.\n\n' +
+                  'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
+                  '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the EXPLANATIONS block only, escape any double quote as \\" and use \\n instead of a real newline.'
+                : 'ANSWERS: JSON object, one entry per question, value = array with the correct letter.\n' +
+                  'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the answer; keep quoted English in English.\n\n' +
+                  'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
+                  '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
+                  '===GG_ANSWERS===\na JSON object only\n' +
+                  '===GG_EXPLANATIONS===\na JSON object only\n' +
+                  '===GG_END===\n\n' +
+                  'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
+            return useKnown
+                ? (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
+                   htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===', 200))
+                : (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
                    htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_ANSWERS===', 200) &&
-                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS===');
+                   answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text     = await callClaude(prompt, 32000, 1, salvage, QUESTION_EFFORT);
+        var text = await callClaude(prompt, 32000, 1, salvage, QUESTION_EFFORT);
         var passages = grabBlock(text, '===GG_PASSAGES===', '===GG_QUESTIONS===');
-        var questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_ANSWERS===');
-        var answers  = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps     = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var questions, answers, exps;
+        if (useKnown) {
+            questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===');
+            exps      = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            answers   = buildAnswersFromKnown(startNum, knownLetters);
+        } else {
+            questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_ANSWERS===');
+            answers   = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
+            exps      = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        }
 
         if (!passages) throw new Error('Part 7: could not read the passages from your paste.');
         if (!questions) throw new Error('Part 7: could not read the questions from your paste.');
@@ -1459,8 +1626,8 @@
             if (parts.indexOf('5') !== -1) {
                 var p5;
                 if (MODE === 'manual') {
-                    log('Part 5 \u2014 formatting and solving your pasted items\u2026');
-                    p5 = await solvePart5Manual(LEVEL, PART5_START, MANUAL_TEXT['5']);
+                    log(KNOWN_ANSWERS['5'] ? 'Part 5 \u2014 formatting your pasted items (answers already verified)\u2026' : 'Part 5 \u2014 formatting and solving your pasted items\u2026');
+                    p5 = await solvePart5Manual(LEVEL, PART5_START, MANUAL_TEXT['5'], KNOWN_ANSWERS['5']);
                 } else {
                     log('Part 5 \u2014 writing and solving 30 items\u2026');
                     p5 = await generatePart5(LEVEL, PART5_START, 30);
@@ -1475,8 +1642,8 @@
             if (parts.indexOf('6') !== -1) {
                 var p6;
                 if (MODE === 'manual') {
-                    log('Part 6 \u2014 formatting and solving your pasted texts\u2026');
-                    p6 = await solvePart6Manual(LEVEL, PART6_START, MANUAL_TEXT['6']);
+                    log(KNOWN_ANSWERS['6'] ? 'Part 6 \u2014 formatting your pasted texts (answers already verified)\u2026' : 'Part 6 \u2014 formatting and solving your pasted texts\u2026');
+                    p6 = await solvePart6Manual(LEVEL, PART6_START, MANUAL_TEXT['6'], KNOWN_ANSWERS['6']);
                 } else {
                     log('Part 6 \u2014 writing 4 texts and solving 16 blanks\u2026');
                     p6 = await generatePart6(LEVEL, PART6_START, 4);
@@ -1491,8 +1658,8 @@
 
             if (parts.indexOf('7') !== -1) {
                 if (MODE === 'manual') {
-                    log('Part 7 \u2014 formatting and solving your pasted passages\u2026');
-                    var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7']);
+                    log(KNOWN_ANSWERS['7'] ? 'Part 7 \u2014 formatting your pasted passages (answers already verified)\u2026' : 'Part 7 \u2014 formatting and solving your pasted passages\u2026');
+                    var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7'], KNOWN_ANSWERS['7']);
                     var mg = m7.groups.single;
                     var fm = renumber(mg.questions, mg.answers, mg.explanations, PART7_START);
                     var em = ensureInputs(fm.questions, fm.answers);
