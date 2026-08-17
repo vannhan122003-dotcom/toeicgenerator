@@ -1015,6 +1015,43 @@
     // name attributes and the answer/explanation keys together. This
     // guarantees questions never collide even if the model ignores the
     // numbering instruction, so grading can never drift.
+    // The model is not always consistent about how it keys the ANSWERS and
+    // EXPLANATIONS objects: "q101", "101" and "Q101" all turn up. renumber()
+    // looks entries up by the exact input name, so a mismatch used to drop
+    // every explanation silently. This resolves each key to the id actually
+    // used in the HTML before any mapping happens.
+    function alignKeys(obj, order) {
+        if (!obj) return {};
+        var keys = Object.keys(obj);
+        if (!keys.length) return {};
+        var known = {};
+        order.forEach(function (id) { known[id] = true; });
+
+        var out = {}, matched = 0;
+        keys.forEach(function (k) {
+            var id = null;
+            if (known[k]) id = k;
+            else if (known['q' + k]) id = 'q' + k;
+            else {
+                var digits = String(k).replace(/\D/g, '');
+                if (digits && known['q' + digits]) id = 'q' + digits;
+            }
+            if (id) { out[id] = obj[k]; matched++; }
+        });
+
+        // Nothing resolved by name, but the count lines up exactly: fall back
+        // to positional matching in numeric order.
+        if (!matched && keys.length === order.length) {
+            keys.slice().sort(function (a, b) {
+                var na = parseInt(String(a).replace(/\D/g, ''), 10);
+                var nb = parseInt(String(b).replace(/\D/g, ''), 10);
+                if (!isNaN(na) && !isNaN(nb)) return na - nb;
+                return String(a) < String(b) ? -1 : 1;
+            }).forEach(function (k, i) { out[order[i]] = obj[k]; });
+        }
+        return out;
+    }
+
     function renumber(questionsHTML, answers, explanations, start) {
         var order = [], seen = {}, m;
         var re = /name\s*=\s*"([^"]+)"/g;
@@ -1024,6 +1061,9 @@
         Object.keys(answers).forEach(function (k) {
             if (!seen[k]) { seen[k] = true; order.push(k); }
         });
+
+        answers      = alignKeys(answers, order);
+        explanations = alignKeys(explanations, order);
 
         var map = {}, newAns = {}, newExp = {};
         order.forEach(function (oldId, i) { map[oldId] = 'q' + (start + i); });
@@ -1272,7 +1312,7 @@
             '</div>\n' +
             'Increment the number, data-q and input name (q' + startNum + ', q' + (startNum + 1) + ', \u2026) for each item in order.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence. KEYS MUST MATCH THE INPUT NAMES EXACTLY, e.g. {"q' + startNum + '": "...", "q' + (startNum + 1) + '": "..."} \u2014 not bare numbers.\n\n' +
                   'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
                   '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
                   '===GG_EXPLANATIONS===\na JSON object only\n' +
@@ -1340,7 +1380,7 @@
             '</div>\n' +
             'Repeat for each text (data-text 1,2,3,\u2026). Every <select> option value MUST be only the letter A/B/C/D.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English. KEYS MUST MATCH THE INPUT NAMES EXACTLY, e.g. {"q' + startNum + '": "..."} \u2014 not bare numbers.\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
                   '===GG_EXPLANATIONS===\na JSON object only\n' +
@@ -1411,7 +1451,7 @@
             '  \u2026 more items \u2026\n</div>\n' +
             'Repeat the toeic-qset per set, matching data-set to the passages.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English. KEYS MUST MATCH THE INPUT NAMES EXACTLY, e.g. {"q' + startNum + '": "..."} \u2014 not bare numbers.\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
                   '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
@@ -1755,6 +1795,7 @@
                     p5 = await generatePart5(LEVEL, PART5_START, 30);
                 }
                 var f5 = renumber(p5.questions, p5.answers, p5.explanations, PART5_START);
+                assertExplanationCoverage('Part 5', f5.answers, f5.explanations);
                 var e5 = ensureInputs(f5.questions, f5.answers);
                 testData.part5 = { questions: e5.questions, answers: f5.answers, explanations: f5.explanations, first: PART5_START, last: PART5_START + f5.count - 1 };
                 log('Part 5 ready \u00b7 ' + f5.count + ' questions (' + PART5_START + '\u2013' + (PART5_START + f5.count - 1) + ').', 'ok');
@@ -1771,6 +1812,7 @@
                     p6 = await generatePart6(LEVEL, PART6_START, 4);
                 }
                 var f6 = renumber(p6.questions, p6.answers, p6.explanations, PART6_START);
+                assertExplanationCoverage('Part 6', f6.answers, f6.explanations);
                 var e6 = ensureInputs(f6.questions, f6.answers);
                 testData.part6 = { questions: e6.questions, answers: f6.answers, explanations: f6.explanations, first: PART6_START, last: PART6_START + f6.count - 1 };
                 usedTopics = usedTopics.concat(p6.topics || []);
@@ -1784,6 +1826,7 @@
                     var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7'], KNOWN_ANSWERS['7']);
                     var mg = m7.groups.single;
                     var fm = renumber(mg.questions, mg.answers, mg.explanations, PART7_START);
+                    assertExplanationCoverage('Part 7', fm.answers, fm.explanations);
                     var em = ensureInputs(fm.questions, fm.answers);
                     testData.part7 = {
                         groups: { single: {
@@ -1801,6 +1844,7 @@
                         var gres = await generatePart7Group(LEVEL, gt, cursor, usedTopics);
                         usedTopics = usedTopics.concat(gres.topics || []);
                         var fg = renumber(gres.questions, gres.answers, gres.explanations, cursor);
+                        assertExplanationCoverage('Part 7 (' + gt + ')', fg.answers, fg.explanations);
                         var eg = ensureInputs(fg.questions, fg.answers);
                         groups[gt] = {
                             label: gInfo.label, passages: gres.passages, questions: eg.questions,
