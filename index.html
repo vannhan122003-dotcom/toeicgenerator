@@ -192,7 +192,7 @@
             <div class="field-hint">Paste real TOEIC questions/passages below for each part you're building. Messy copy-paste is fine (line breaks, dashes as blanks) &mdash; the AI cleans it up. It will <b>not</b> rewrite your content, only format and solve it.</div>
 
             <div id="uploadMdBox" class="paste-box" style="border:1.5px dashed var(--border);border-radius:10px;padding:16px;background:#fafcfe;">
-                <div class="paste-label"><i class="fa-solid fa-file-arrow-up"></i> Upload a prepared full test <small>(.md/.txt with Part 5/6/7 + an answer key &mdash; auto-fills the three boxes below. If an answer key is found, the AI <b>skips solving entirely</b> and only formats &amp; writes explanations &mdash; the cheapest possible run.)</small></div>
+                <div class="paste-label"><i class="fa-solid fa-file-arrow-up"></i> Upload a prepared full test <small>(.md/.txt with Part 5/6/7 + an answer key &mdash; auto-fills the three boxes below. If an answer key is found, the AI <b>skips solving entirely</b> and only formats &amp; writes explanations &mdash; the cheapest possible run. Answer positions are re-balanced across A&ndash;D on export, so a lopsided key from the source file is corrected automatically.)</small></div>
                 <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
                 <div id="mdUploadStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:8px;line-height:1.5;"></div>
             </div>
@@ -542,6 +542,122 @@
     function answersBlockComplete(t, startMarker, endMarker) {
         var a = safeJSONObject(grabBlock(t, startMarker, endMarker));
         return !!(a && Object.keys(a).length);
+    }
+
+    // Same test as answersBlockComplete, but for the explanations block. This
+    // exists because when an uploaded answer key is used the answers are built
+    // locally and can never be empty — so without this check a response that
+    // stopped after the HTML block would be accepted as "complete" and the
+    // test would export with no explanations at all, silently.
+    function explanationsBlockComplete(t) {
+        var e = safeJSONObject(grabBlock(t, '===GG_EXPLANATIONS===', '===GG_END==='));
+        return !!(e && Object.keys(e).length);
+    }
+
+    // Refuses to continue when the model returned far fewer explanations than
+    // there are questions. Loud failure beats a quiet gap the teacher only
+    // discovers when a student opens the panel in class.
+    function assertExplanationCoverage(label, answers, exps) {
+        var want = Object.keys(answers || {}).length;
+        var got  = Object.keys(exps || {}).length;
+        if (!want) return;
+        if (got === 0) {
+            throw new Error(label + ': the model returned no explanations. Nothing was exported — run this part again.');
+        }
+        if (got < Math.ceil(want * 0.9)) {
+            throw new Error(label + ': only ' + got + ' explanations came back for ' + want + ' questions. Run this part again.');
+        }
+        if (got < want) {
+            log(label + ': ' + (want - got) + ' question(s) have no explanation.', 'warn');
+        }
+    }
+
+    // ---- Answer-position balancing ---------------------------------------
+    // Models writing a 100-item key in one pass do not track how often each
+    // letter is used; runs of eight identical answers are common, and a
+    // student who spots it can score well without reading. This rewrites the
+    // option order so the correct answers spread evenly across A-D. It is
+    // pure string work: no API call, no cost, and the correct option TEXT is
+    // never changed — only its position.
+    var BALANCE_KEEP_LAST = ['not mentioned', 'no article', 'none of', 'all of the above'];
+
+    function balanceAnswers(html, answers) {
+        if (!html || !answers) return { html: html, answers: answers };
+        var letters = ['A', 'B', 'C', 'D'];
+        var ids = Object.keys(answers).sort(function (a, b) {
+            return parseInt(a.replace(/\D/g, ''), 10) - parseInt(b.replace(/\D/g, ''), 10);
+        });
+        var seat = 0;
+
+        ids.forEach(function (qid) {
+            var cur = (answers[qid] && answers[qid][0] || '').toUpperCase();
+            if (letters.indexOf(cur) === -1) return;
+
+            // Read this question's four options, radio inputs or a <select>.
+            var opts = null, kind = null;
+            var radioRe = new RegExp('name="' + qid + '"\\s+value="([A-D])"[^>]*>\\s*\\(([A-D])\\)\\s*([^<]*)', 'g');
+            var found = [], m;
+            while ((m = radioRe.exec(html))) found.push([m[1], m[3]]);
+            if (found.length === 4) { opts = found; kind = 'radio'; }
+            if (!opts) {
+                var selRe = new RegExp('<select name="' + qid + '">([\\s\\S]*?)</select>');
+                var sm = selRe.exec(html);
+                if (sm) {
+                    var o = [], om, oRe = /<option value="([A-D])">([^<]*)<\/option>/g;
+                    while ((om = oRe.exec(sm[1]))) o.push([om[1], om[2]]);
+                    if (o.length === 4) { opts = o; kind = 'select'; }
+                }
+            }
+            if (!opts) return;
+
+            // Leave catch-all options where the writer put them.
+            var hasKeeper = opts.some(function (p) {
+                var t = String(p[1]).toLowerCase();
+                return BALANCE_KEEP_LAST.some(function (k) { return t.indexOf(k) !== -1; });
+            });
+            if (hasKeeper) { seat++; return; }
+
+            var want = letters[seat % 4];
+            seat++;
+            if (want === cur) return;
+
+            var shift = (letters.indexOf(cur) - letters.indexOf(want) + 4) % 4;
+            var byLetter = {};
+            opts.forEach(function (p) { byLetter[p[0]] = p[1]; });
+            var texts = letters.map(function (L) {
+                return byLetter[letters[(letters.indexOf(L) + shift) % 4]];
+            });
+
+            if (kind === 'radio') {
+                letters.forEach(function (L, i) {
+                    var re = new RegExp('(name="' + qid + '"\\s+value="' + L + '"[^>]*>\\s*\\(' + L + '\\)\\s*)[^<]*');
+                    html = html.replace(re, function (full, head) { return head + texts[i]; });
+                });
+            } else {
+                var re2 = new RegExp('(<select name="' + qid + '">)([\\s\\S]*?)(</select>)');
+                html = html.replace(re2, function (full, open, inner, close) {
+                    var blank = /<option value="">[\s\S]*?<\/option>/.exec(inner);
+                    var rebuilt = (blank ? blank[0] : '');
+                    letters.forEach(function (L, i) {
+                        rebuilt += '<option value="' + L + '">' + texts[i] + '</option>';
+                    });
+                    return open + rebuilt + close;
+                });
+            }
+            answers[qid] = [want];
+        });
+
+        return { html: html, answers: answers };
+    }
+
+    // Reports the spread so a bad key is visible in the log before export.
+    function answerSpread(answers) {
+        var c = { A: 0, B: 0, C: 0, D: 0 }, n = 0;
+        Object.keys(answers || {}).forEach(function (k) {
+            var L = (answers[k] && answers[k][0] || '').toUpperCase();
+            if (c[L] !== undefined) { c[L]++; n++; }
+        });
+        return { counts: c, total: n };
     }
 
     // Attempts to fix the most common way Claude's JSON breaks: an unescaped
@@ -1173,7 +1289,8 @@
 
         function salvage(t) {
             return useKnown
-                ? htmlBlockComplete(t, '===GG_ITEMS===', '===GG_EXPLANATIONS===', 300)
+                ? (htmlBlockComplete(t, '===GG_ITEMS===', '===GG_EXPLANATIONS===', 300) &&
+                   explanationsBlockComplete(t))
                 : (htmlBlockComplete(t, '===GG_ITEMS===', '===GG_ANSWERS===', 300) &&
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
@@ -1193,6 +1310,7 @@
         if (!items) throw new Error('Part 5: could not read any items from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 5: could not solve the answer key.');
         return { questions: items, answers: answers, explanations: exps };
+        assertExplanationCoverage('Part 5', answers, exps);
     }
 
     async function solvePart6Manual(level, startNum, raw, knownLetters) {
@@ -1239,7 +1357,8 @@
 
         function salvage(t) {
             return useKnown
-                ? htmlBlockComplete(t, '===GG_TEXTS===', '===GG_EXPLANATIONS===', 300)
+                ? (htmlBlockComplete(t, '===GG_TEXTS===', '===GG_EXPLANATIONS===', 300) &&
+                   explanationsBlockComplete(t))
                 : (htmlBlockComplete(t, '===GG_TEXTS===', '===GG_ANSWERS===', 300) &&
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
@@ -1258,6 +1377,7 @@
 
         if (!texts) throw new Error('Part 6: could not read any texts from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 6: could not solve the answer key.');
+        assertExplanationCoverage('Part 6', answers, exps);
         return { questions: texts, answers: answers, explanations: exps };
     }
 
@@ -1311,7 +1431,8 @@
         function salvage(t) {
             return useKnown
                 ? (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
-                   htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===', 200))
+                   htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===', 200) &&
+                   explanationsBlockComplete(t))
                 : (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
                    htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_ANSWERS===', 200) &&
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
@@ -1333,6 +1454,7 @@
         if (!passages) throw new Error('Part 7: could not read the passages from your paste.');
         if (!questions) throw new Error('Part 7: could not read the questions from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 7: could not solve the answer key.');
+        assertExplanationCoverage('Part 7', answers, exps);
 
         // Present as a single group so the Part-7 renderer shows one dual-pane set.
         return {
@@ -1752,6 +1874,41 @@
                 Object.keys(grp.explanations).forEach(function (k) { explanations[k] = grp.explanations[k]; });
             });
         }
+
+        // Spread the correct answers evenly across A-D before export. Each
+        // part's option HTML is rewritten in place; the correct option text
+        // never changes, only which letter it sits under.
+        var before = answerSpread(answers);
+        if (testData.part5) {
+            var r5 = balanceAnswers(testData.part5.questions, testData.part5.answers);
+            testData.part5.questions = r5.html;
+            Object.keys(r5.answers).forEach(function (k) { answers[k] = r5.answers[k]; });
+        }
+        if (testData.part6) {
+            var r6 = balanceAnswers(testData.part6.texts || testData.part6.questions, testData.part6.answers);
+            if (testData.part6.texts) { testData.part6.texts = r6.html; } else { testData.part6.questions = r6.html; }
+            Object.keys(r6.answers).forEach(function (k) { answers[k] = r6.answers[k]; });
+        }
+        if (testData.part7) {
+            ['single', 'double', 'triple'].forEach(function (gt) {
+                var grp = testData.part7.groups[gt];
+                if (!grp) return;
+                var r7 = balanceAnswers(grp.questions, grp.answers);
+                grp.questions = r7.html;
+                Object.keys(r7.answers).forEach(function (k) { answers[k] = r7.answers[k]; });
+            });
+        }
+        var after = answerSpread(answers);
+        log('Answer spread before balancing: A' + before.counts.A + ' B' + before.counts.B +
+            ' C' + before.counts.C + ' D' + before.counts.D +
+            '  \u2192  after: A' + after.counts.A + ' B' + after.counts.B +
+            ' C' + after.counts.C + ' D' + after.counts.D, 'ok');
+        ['A', 'B', 'C', 'D'].forEach(function (L) {
+            if (after.total && after.counts[L] / after.total > 0.35) {
+                log('Warning: ' + L + ' is still the answer ' +
+                    Math.round(after.counts[L] / after.total * 100) + '% of the time.', 'warn');
+            }
+        });
 
         var answersJSON      = JSON.stringify(answers).replace(/<\/script>/gi, '<\\/script>');
         var explanationsJSON = JSON.stringify(explanations || {}).replace(/<\/script>/gi, '<\\/script>');
