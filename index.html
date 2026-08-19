@@ -998,7 +998,7 @@
         var text    = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
         var items   = grabBlock(text, '===GG_ITEMS===', '===GG_ANSWERS===');
         var answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
 
         if (!items) throw new Error('Part 5: the model returned no items.');
         if (!Object.keys(answers).length) throw new Error('Part 5: the answer key came back empty.');
@@ -1137,6 +1137,22 @@
         return out;
     }
 
+    // Defensive fallback: the model is instructed to key EXPLANATIONS exactly
+    // like the "qN" name attributes it just wrote, but if it instead used a
+    // bare number ("101"), a differently-cased key ("Q101"), or a numeric
+    // JSON key, this normalizes it to the "qN" format the rest of the tool
+    // expects — so explanations don't silently disappear over a formatting
+    // mismatch the model made.
+    function normalizeExplanationKeys(exps) {
+        var out = {};
+        Object.keys(exps || {}).forEach(function (k) {
+            var m = /^q?(\d+)$/i.exec(k.trim());
+            var newKey = m ? ('q' + m[1]) : k;
+            out[newKey] = exps[k];
+        });
+        return out;
+    }
+
     async function solvePart5Manual(level, startNum, raw, knownLetters) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 5: paste box is empty.');
@@ -1166,7 +1182,7 @@
             '</div>\n' +
             'Increment the number, data-q and input name (q' + startNum + ', q' + (startNum + 1) + ', \u2026) for each item in order.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per item, 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per item, KEYED EXACTLY like the input names above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026) \u2014 same keys as the radio button "name" attributes you just wrote. Value = 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
                   '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
                   '===GG_EXPLANATIONS===\na JSON object only\n' +
@@ -1192,12 +1208,12 @@
         var items, answers, exps;
         if (useKnown) {
             items   = grabBlock(text, '===GG_ITEMS===', '===GG_EXPLANATIONS===');
-            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers = buildAnswersFromKnown(startNum, knownLetters);
         } else {
             items   = grabBlock(text, '===GG_ITEMS===', '===GG_ANSWERS===');
             answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
         }
 
         if (!items) throw new Error('Part 5: could not read any items from your paste.');
@@ -1232,14 +1248,14 @@
             '</div>\n' +
             'Repeat for each text (data-text 1,2,3,\u2026). Every <select> option value MUST be only the letter A/B/C/D.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per blank, KEYED EXACTLY like the select/input "name" attributes above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026). Value = 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
                   '===GG_EXPLANATIONS===\na JSON object only\n' +
                   '===GG_END===\n\n' +
                   'Inside the EXPLANATIONS block only, escape any double quote as \\" and use \\n instead of a real newline.'
-                : 'ANSWERS: JSON object, one entry per blank, value = array with the correct letter.\n' +
-                  'EXPLANATIONS: JSON object, one entry per blank, 1 short sentence WRITTEN IN VIETNAMESE justifying the answer from the surrounding text; keep quoted English words in English.\n\n' +
+                : 'ANSWERS: JSON object, one entry per blank, KEYED EXACTLY like the select/input "name" attributes above (e.g. "q' + startNum + '"). Value = array with the correct letter, e.g. {"q' + startNum + '": ["A"]}.\n' +
+                  'EXPLANATIONS: JSON object, same keys as ANSWERS, 1 short sentence WRITTEN IN VIETNAMESE justifying the answer from the surrounding text; keep quoted English words in English.\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
                   '===GG_ANSWERS===\na JSON object only\n' +
@@ -1258,12 +1274,12 @@
         var texts, answers, exps;
         if (useKnown) {
             texts   = grabBlock(text, '===GG_TEXTS===', '===GG_EXPLANATIONS===');
-            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers = buildAnswersFromKnown(startNum, knownLetters);
         } else {
             texts   = grabBlock(text, '===GG_TEXTS===', '===GG_ANSWERS===');
             answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-            exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
         }
 
         if (!texts) throw new Error('Part 6: could not read any texts from your paste.');
@@ -1301,15 +1317,15 @@
             '  \u2026 more items \u2026\n</div>\n' +
             'Repeat the toeic-qset per set, matching data-set to the passages.\n\n' +
             (useKnown
-                ? 'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English.\n\n' +
+                ? 'EXPLANATIONS: JSON object, one entry per question, KEYED EXACTLY like the radio "name" attributes above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026). Value = 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
                   '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
                   '===GG_EXPLANATIONS===\na JSON object only\n' +
                   '===GG_END===\n\n' +
                   'Inside the EXPLANATIONS block only, escape any double quote as \\" and use \\n instead of a real newline.'
-                : 'ANSWERS: JSON object, one entry per question, value = array with the correct letter.\n' +
-                  'EXPLANATIONS: JSON object, one entry per question, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the answer; keep quoted English in English.\n\n' +
+                : 'ANSWERS: JSON object, one entry per question, KEYED EXACTLY like the radio "name" attributes above (e.g. "q' + startNum + '"). Value = array with the correct letter, e.g. {"q' + startNum + '": ["A"]}.\n' +
+                  'EXPLANATIONS: JSON object, same keys as ANSWERS, 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the answer; keep quoted English in English.\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
                   '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
@@ -1332,12 +1348,12 @@
         var questions, answers, exps;
         if (useKnown) {
             questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===');
-            exps      = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps      = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers   = buildAnswersFromKnown(startNum, knownLetters);
         } else {
             questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_ANSWERS===');
             answers   = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-            exps      = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+            exps      = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
         }
 
         if (!passages) throw new Error('Part 7: could not read the passages from your paste.');
@@ -1426,7 +1442,7 @@
         var text    = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
         var texts   = grabBlock(text, '===GG_TEXTS===', '===GG_ANSWERS===');
         var answers = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps    = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
 
         if (!texts) throw new Error('Part 6: the model returned no texts.');
         if (!Object.keys(answers).length) throw new Error('Part 6: the answer key came back empty.');
@@ -1569,7 +1585,7 @@
         var text      = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
         var questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_ANSWERS===');
         var answers   = safeJSONObject(grabBlock(text, '===GG_ANSWERS===', '===GG_EXPLANATIONS===')) || {};
-        var exps      = safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {};
+        var exps      = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
 
         if (!questions) throw new Error('Part 7 (' + g.label + '): the model returned no questions.');
         if (!Object.keys(answers).length) throw new Error('Part 7 (' + g.label + '): the answer key came back empty.');
