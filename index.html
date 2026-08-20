@@ -1047,21 +1047,29 @@
     // "**Part 5:** 101-A, 102-C, ...". Deterministic string parsing only —
     // no AI call, no cost, and it fails loudly if the headers aren't found
     // rather than silently guessing.
+    //
+    // The "##" markdown prefix is treated as OPTIONAL here on purpose: some
+    // generators (including some local/cloud models used to draft tests
+    // before uploading) reliably produce every other part of this template
+    // correctly but drop the "##" in front of "PART N" / "ANSWER KEY" even
+    // when explicitly instructed not to, across repeated attempts. Rather
+    // than keep re-prompting for a cosmetic formatting detail, the parser
+    // just accepts both "## PART 5" and "PART 5" as valid headers.
     function parseFullTestMD(md) {
         md = String(md || '').replace(/\r\n?/g, '\n');
         function headerIndex(re) { var m = re.exec(md); return m ? m.index : -1; }
-        var i5 = headerIndex(/^##\s*PART\s*5\b.*$/im);
-        var i6 = headerIndex(/^##\s*PART\s*6\b.*$/im);
-        var i7 = headerIndex(/^##\s*PART\s*7\b.*$/im);
-        var iKey = headerIndex(/^##\s*ANSWER\s*KEY\b.*$/im);
+        var i5 = headerIndex(/^#{0,2}\s*PART\s*5\b.*$/im);
+        var i6 = headerIndex(/^#{0,2}\s*PART\s*6\b.*$/im);
+        var i7 = headerIndex(/^#{0,2}\s*PART\s*7\b.*$/im);
+        var iKey = headerIndex(/^#{0,2}\s*ANSWER\s*KEY\b.*$/im);
         if (i5 < 0 || i6 < 0 || i7 < 0 || !(i5 < i6 && i6 < i7)) {
-            throw new Error('Could not find "## PART 5", "## PART 6" and "## PART 7" section headers in this file, in order.');
+            throw new Error('Could not find "PART 5", "PART 6" and "PART 7" section headers in this file, in order (with or without a leading "##").');
         }
         var end7 = (iKey >= 0 && iKey > i7) ? iKey : md.length;
 
         function sectionBody(start, end) {
             var chunk = md.slice(start, end);
-            return chunk.replace(/^##.*$/m, '').trim();
+            return chunk.replace(/^#{0,2}.*$/m, '').trim();
         }
 
         var known = { '5': [], '6': [], '7': [] };
