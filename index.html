@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
     <style>
         :root {
             --navy-950:#0e2440; --navy-800:#173b64; --blue-700:#1f5f96; --blue-500:#3f86bd;
@@ -193,10 +194,10 @@
 
         <div class="field-group" id="pastePanel">
             <div class="field-label"><i class="fa-solid fa-paste"></i> <span class="vi-label">Dán hoặc tải lên đề của bạn<span class="en-label">Paste or Upload Your Test</span></span></div>
-            <div class="field-hint">Dán toàn bộ đề bên dưới (Part 5 + 6 + 7, kèm đáp án nếu có) hoặc tải lên file <b>.md/.txt</b> &mdash; AI tự nhận diện từng phần. Nếu tìm thấy đáp án đã kiểm tra, AI <b>bỏ qua bước giải</b> và chỉ định dạng + giải thích &mdash; tiết kiệm nhất. (Paste the whole test or upload a file &mdash; auto-detected. If a verified answer key is found, the AI skips solving entirely.)</div>
+            <div class="field-hint">Dán toàn bộ đề bên dưới (Part 5 + 6 + 7, kèm đáp án nếu có) hoặc tải lên file <b>.md/.txt/.docx</b> &mdash; AI tự nhận diện từng phần. Nếu tìm thấy đáp án đã kiểm tra, AI <b>bỏ qua bước giải</b> và chỉ định dạng + giải thích &mdash; tiết kiệm nhất. (Paste the whole test or upload a file &mdash; auto-detected. If a verified answer key is found, the AI skips solving entirely.)</div>
 
             <div id="uploadMdBox" class="paste-box" style="border:1.5px dashed var(--border);border-radius:10px;padding:16px;background:#fafcfe;">
-                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
+                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt,.docx" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
                 <div id="mdUploadStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:8px;line-height:1.5;"></div>
             </div>
 
@@ -1041,10 +1042,76 @@
         };
     }
 
-    function handleMdUpload(evt) {
+    // .docx is a zip of XML, not plain text — it can't be read with
+    // FileReader.readAsText() the way .md/.txt can. Mammoth.js unpacks it
+    // client-side (no server, nothing uploaded anywhere) and gives us HTML
+    // we walk ourselves, converting Word's real heading/bold styles into
+    // the "## " / "**bold**" markers the splitter looks for — this matters
+    // because a .docx heading is usually a Word style, not literal typed
+    // "##" characters, so the splitter would see nothing without this step.
+    function docxHtmlToMarkdown(html) {
+        var container = document.createElement('div');
+        container.innerHTML = html;
+        var lines = [];
+
+        function tableToMarkdown(table) {
+            var rows = Array.prototype.slice.call(table.querySelectorAll('tr'));
+            var out = [];
+            rows.forEach(function (tr, i) {
+                var cells = Array.prototype.slice.call(tr.querySelectorAll('th,td'))
+                    .map(function (c) { return c.textContent.trim().replace(/\|/g, '\\|'); });
+                out.push('| ' + cells.join(' | ') + ' |');
+                if (i === 0) out.push('|' + cells.map(function () { return '---'; }).join('|') + '|');
+            });
+            return out.join('\n');
+        }
+
+        Array.prototype.forEach.call(container.children, function (node) {
+            var tag = node.tagName ? node.tagName.toLowerCase() : '';
+            if (/^h[1-6]$/.test(tag)) {
+                lines.push('## ' + node.textContent.trim());
+            } else if (tag === 'table') {
+                lines.push(tableToMarkdown(node));
+            } else if (tag === 'p' || tag === 'li') {
+                var html2 = node.innerHTML
+                    .replace(/<(strong|b)[^>]*>/gi, '**').replace(/<\/(strong|b)>/gi, '**')
+                    .replace(/<[^>]+>/g, '');
+                var tmp = document.createElement('div');
+                tmp.innerHTML = html2;
+                lines.push((tag === 'li' ? '- ' : '') + tmp.textContent.trim());
+            } else {
+                var txt = node.textContent.trim();
+                if (txt) lines.push(txt);
+            }
+        });
+        return lines.join('\n\n');
+    }
+
+    async function handleMdUpload(evt) {
         var file = evt.target.files && evt.target.files[0];
         var statusEl = document.getElementById('mdUploadStatus');
         if (!file) return;
+
+        if (/\.docx$/i.test(file.name)) {
+            if (typeof mammoth === 'undefined') {
+                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Th\u01b0 vi\u1ec7n \u0111\u1ecdc .docx ch\u01b0a t\u1ea3i \u0111\u01b0\u1ee3c \u2014 ki\u1ec3m tra k\u1ebft n\u1ed1i m\u1ea1ng r\u1ed3i th\u1eed l\u1ea1i.';
+                return;
+            }
+            try {
+                if (statusEl) statusEl.innerHTML = '\u23f3 \u0110ang \u0111\u1ecdc file .docx\u2026';
+                var arrayBuffer = await file.arrayBuffer();
+                var result = await mammoth.convertToHtml({ arrayBuffer: arrayBuffer });
+                var md = docxHtmlToMarkdown(result.value);
+                document.getElementById('pasteFullText').value = md;
+                if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
+                log('Uploaded "' + file.name + '" (docx) \u2014 checking format\u2026');
+                onFullPasteInput();
+            } catch (err) {
+                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Kh\u00f4ng \u0111\u1ecdc \u0111\u01b0\u1ee3c file .docx: ' + err.message;
+            }
+            return;
+        }
+
         var reader = new FileReader();
         reader.onload = function (e) {
             document.getElementById('pasteFullText').value = e.target.result;
