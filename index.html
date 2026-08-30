@@ -8,7 +8,6 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js"></script>
     <style>
         :root {
             --navy-950:#0e2440; --navy-800:#173b64; --blue-700:#1f5f96; --blue-500:#3f86bd;
@@ -194,10 +193,10 @@
 
         <div class="field-group" id="pastePanel">
             <div class="field-label"><i class="fa-solid fa-paste"></i> <span class="vi-label">Dán hoặc tải lên đề của bạn<span class="en-label">Paste or Upload Your Test</span></span></div>
-            <div class="field-hint">Dán toàn bộ đề bên dưới (Part 5 + 6 + 7, kèm đáp án nếu có) hoặc tải lên file <b>.md/.txt/.docx</b> &mdash; AI tự nhận diện từng phần. Nếu tìm thấy đáp án đã kiểm tra, AI <b>bỏ qua bước giải</b> và chỉ định dạng + giải thích &mdash; tiết kiệm nhất. (Paste the whole test or upload a file &mdash; auto-detected. If a verified answer key is found, the AI skips solving entirely.)</div>
+            <div class="field-hint">Dán toàn bộ đề bên dưới (Part 5 + 6 + 7, kèm đáp án nếu có) hoặc tải lên file <b>.md/.txt</b> &mdash; AI tự nhận diện từng phần. Nếu tìm thấy đáp án đã kiểm tra, AI <b>bỏ qua bước giải</b> và chỉ định dạng + giải thích &mdash; tiết kiệm nhất. (Paste the whole test or upload a file &mdash; auto-detected. If a verified answer key is found, the AI skips solving entirely.)</div>
 
             <div id="uploadMdBox" class="paste-box" style="border:1.5px dashed var(--border);border-radius:10px;padding:16px;background:#fafcfe;">
-                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt,.docx" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
+                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
                 <div id="mdUploadStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:8px;line-height:1.5;"></div>
             </div>
 
@@ -993,44 +992,65 @@
     function parseFullTestMD(md) {
         md = String(md || '').replace(/\r\n?/g, '\n');
         function headerIndex(re) { var m = re.exec(md); return m ? m.index : -1; }
-        var i5 = headerIndex(/^#{0,2}\s*PART\s*5\b.*$/im);
-        var i6 = headerIndex(/^#{0,2}\s*PART\s*6\b.*$/im);
-        var i7 = headerIndex(/^#{0,2}\s*PART\s*7\b.*$/im);
-        var iKey = headerIndex(/^#{0,2}\s*ANSWER\s*KEY\b.*$/im);
+        // Tolerant of ANY common decorative wrapper before the literal words —
+        // "## PART 5", "**PART 5**", "### **PART 5:**", or just bare "PART 5"
+        // all match, since different generators wrap headers differently and
+        // none of that decoration should be load-bearing for finding the
+        // section.
+        var i5 = headerIndex(/^[#*\s]*PART\s*5\b.*$/im);
+        var i6 = headerIndex(/^[#*\s]*PART\s*6\b.*$/im);
+        var i7 = headerIndex(/^[#*\s]*PART\s*7\b.*$/im);
+        var iKey = headerIndex(/^[#*\s]*ANSWER\s*KEY\b.*$/im);
         if (i5 < 0 || i6 < 0 || i7 < 0 || !(i5 < i6 && i6 < i7)) {
-            throw new Error('Could not find "PART 5", "PART 6" and "PART 7" section headers in this file, in order (with or without a leading "##").');
+            throw new Error('Could not find "PART 5", "PART 6" and "PART 7" section headers in this file, in order.');
         }
         var end7 = (iKey >= 0 && iKey > i7) ? iKey : md.length;
 
         function sectionBody(start, end) {
             var chunk = md.slice(start, end);
-            return chunk.replace(/^#{0,2}.*$/m, '').trim();
+            return chunk.replace(/^[#*\s]*.*$/m, '').trim();
         }
 
+        // Answer-key extraction is deliberately format-agnostic: rather than
+        // looking for a "Part N" label in any particular style (bold, plain,
+        // with or without a colon, followed by a dash or not — every one of
+        // these has shown up from different generators and each one breaking
+        // the parser is a losing game), just scan the WHOLE answer-key block
+        // for every "NUMBER-LETTER" pair and sort each one into Part 5/6/7
+        // purely by its question number, which we always know the valid
+        // range for (101-130 / 131-146 / 147-200). This works no matter how
+        // — or whether — the parts are individually labeled inside the key,
+        // and no matter what surrounds each pair (a comma, a parenthetical
+        // explanation, a colon-explanation, a bare line break, Vietnamese
+        // text, anything). The separator between number and letter is also
+        // tolerant of the styles actually seen so far: dash, period, colon,
+        // or a closing parenthesis.
         var known = { '5': [], '6': [], '7': [] };
         if (iKey >= 0) {
             var keyBlock = md.slice(iKey);
-            // Read from "**Part N:**" up to the NEXT "**Part ...:**" marker (or end of
-            // text) rather than stopping at the first line break — some generators
-            // wrap a long answer list across several lines instead of one, and a
-            // single-line capture would silently truncate the list.
+            var buckets = { '5': [], '6': [], '7': [] };
+            var pairRe = /(\d{2,3})\s*[-.:)]\s*([A-D])\b/gi;
+            var mm;
+            while ((mm = pairRe.exec(keyBlock)) !== null) {
+                var num = parseInt(mm[1], 10);
+                var letter = mm[2].toUpperCase();
+                if (num >= 101 && num <= 130) buckets['5'].push({ num: num, letter: letter });
+                else if (num >= 131 && num <= 146) buckets['6'].push({ num: num, letter: letter });
+                else if (num >= 147 && num <= 200) buckets['7'].push({ num: num, letter: letter });
+                // numbers outside 101-200 are ignored — not a real TOEIC
+                // question number, most likely incidental (a date, a dollar
+                // amount, a percentage) inside an explanation string.
+            }
             ['5', '6', '7'].forEach(function (p) {
-                var re = new RegExp('\\*\\*Part\\s*' + p + ':\\*\\*([\\s\\S]*?)(?=\\*\\*Part\\s*\\d+:\\*\\*|$)', 'i');
-                var m = re.exec(keyBlock);
-                if (!m) return;
-                // Scan for every "NUM-LETTER" pair directly, rather than
-                // splitting on commas first — some generators separate pairs
-                // with a comma on the same line but only a bare line break
-                // between lines, which would otherwise merge two pairs into
-                // one unparseable chunk and silently drop one answer per line.
-                var pairs = [];
-                var pairRe = /(\d+)\s*-\s*([A-D])\b/gi;
-                var mm;
-                while ((mm = pairRe.exec(m[1])) !== null) {
-                    pairs.push({ num: parseInt(mm[1], 10), letter: mm[2].toUpperCase() });
-                }
-                pairs.sort(function (a, b) { return a.num - b.num; });
-                known[p] = pairs.map(function (x) { return x.letter; });
+                // De-duplicate by question number (keep whichever occurrence
+                // sorts in), in case a number is mentioned more than once in
+                // prose (e.g. an explanation that also cross-references
+                // another question) — collapsing to unique numbers first
+                // keeps this safe either way.
+                var byNum = {};
+                buckets[p].forEach(function (x) { byNum[x.num] = x.letter; });
+                var nums = Object.keys(byNum).map(Number).sort(function (a, b) { return a - b; });
+                known[p] = nums.map(function (n) { return byNum[n]; });
             });
         }
 
@@ -1042,76 +1062,10 @@
         };
     }
 
-    // .docx is a zip of XML, not plain text — it can't be read with
-    // FileReader.readAsText() the way .md/.txt can. Mammoth.js unpacks it
-    // client-side (no server, nothing uploaded anywhere) and gives us HTML
-    // we walk ourselves, converting Word's real heading/bold styles into
-    // the "## " / "**bold**" markers the splitter looks for — this matters
-    // because a .docx heading is usually a Word style, not literal typed
-    // "##" characters, so the splitter would see nothing without this step.
-    function docxHtmlToMarkdown(html) {
-        var container = document.createElement('div');
-        container.innerHTML = html;
-        var lines = [];
-
-        function tableToMarkdown(table) {
-            var rows = Array.prototype.slice.call(table.querySelectorAll('tr'));
-            var out = [];
-            rows.forEach(function (tr, i) {
-                var cells = Array.prototype.slice.call(tr.querySelectorAll('th,td'))
-                    .map(function (c) { return c.textContent.trim().replace(/\|/g, '\\|'); });
-                out.push('| ' + cells.join(' | ') + ' |');
-                if (i === 0) out.push('|' + cells.map(function () { return '---'; }).join('|') + '|');
-            });
-            return out.join('\n');
-        }
-
-        Array.prototype.forEach.call(container.children, function (node) {
-            var tag = node.tagName ? node.tagName.toLowerCase() : '';
-            if (/^h[1-6]$/.test(tag)) {
-                lines.push('## ' + node.textContent.trim());
-            } else if (tag === 'table') {
-                lines.push(tableToMarkdown(node));
-            } else if (tag === 'p' || tag === 'li') {
-                var html2 = node.innerHTML
-                    .replace(/<(strong|b)[^>]*>/gi, '**').replace(/<\/(strong|b)>/gi, '**')
-                    .replace(/<[^>]+>/g, '');
-                var tmp = document.createElement('div');
-                tmp.innerHTML = html2;
-                lines.push((tag === 'li' ? '- ' : '') + tmp.textContent.trim());
-            } else {
-                var txt = node.textContent.trim();
-                if (txt) lines.push(txt);
-            }
-        });
-        return lines.join('\n\n');
-    }
-
-    async function handleMdUpload(evt) {
+    function handleMdUpload(evt) {
         var file = evt.target.files && evt.target.files[0];
         var statusEl = document.getElementById('mdUploadStatus');
         if (!file) return;
-
-        if (/\.docx$/i.test(file.name)) {
-            if (typeof mammoth === 'undefined') {
-                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Th\u01b0 vi\u1ec7n \u0111\u1ecdc .docx ch\u01b0a t\u1ea3i \u0111\u01b0\u1ee3c \u2014 ki\u1ec3m tra k\u1ebft n\u1ed1i m\u1ea1ng r\u1ed3i th\u1eed l\u1ea1i.';
-                return;
-            }
-            try {
-                if (statusEl) statusEl.innerHTML = '\u23f3 \u0110ang \u0111\u1ecdc file .docx\u2026';
-                var arrayBuffer = await file.arrayBuffer();
-                var result = await mammoth.convertToHtml({ arrayBuffer: arrayBuffer });
-                var md = docxHtmlToMarkdown(result.value);
-                document.getElementById('pasteFullText').value = md;
-                if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
-                log('Uploaded "' + file.name + '" (docx) \u2014 checking format\u2026');
-                onFullPasteInput();
-            } catch (err) {
-                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Kh\u00f4ng \u0111\u1ecdc \u0111\u01b0\u1ee3c file .docx: ' + err.message;
-            }
-            return;
-        }
-
         var reader = new FileReader();
         reader.onload = function (e) {
             document.getElementById('pasteFullText').value = e.target.result;
