@@ -974,6 +974,7 @@
     // safer than normal manual mode (no answer-deriving reasoning, no risk
     // of the AI flipping a correct answer).
     var KNOWN_ANSWERS = { '5': null, '6': null, '7': null };
+    var KNOWN_EXPLANATIONS = { '5': null, '6': null, '7': null };
 
     // Parses the exact .md template this tool (and its companion chat
     // workflow) produces: "## PART 5 ..." / "## PART 6 ..." / "## PART 7 ..."
@@ -1025,32 +1026,58 @@
         // text, anything). The separator between number and letter is also
         // tolerant of the styles actually seen so far: dash, period, colon,
         // or a closing parenthesis.
+        //
+        // Alongside the letter, also capture whatever text sits between this
+        // answer and the next one — if the source already wrote out a real
+        // explanation (in parentheses, after a colon, however), grabbing it
+        // here means the AI never has to be asked to write a new one from
+        // scratch: an explanation that already exists and gets silently
+        // discarded, only for the AI to regenerate an equivalent one, is a
+        // pure waste of output tokens.
         var known = { '5': [], '6': [], '7': [] };
+        var knownExp = { '5': [], '6': [], '7': [] };
         if (iKey >= 0) {
             var keyBlock = md.slice(iKey);
             var buckets = { '5': [], '6': [], '7': [] };
             var pairRe = /(\d{2,3})\s*[-.:)]\s*([A-D])\b/gi;
+            var matches = [];
+            var starts = [];
             var mm;
             while ((mm = pairRe.exec(keyBlock)) !== null) {
-                var num = parseInt(mm[1], 10);
-                var letter = mm[2].toUpperCase();
-                if (num >= 101 && num <= 130) buckets['5'].push({ num: num, letter: letter });
-                else if (num >= 131 && num <= 146) buckets['6'].push({ num: num, letter: letter });
-                else if (num >= 147 && num <= 200) buckets['7'].push({ num: num, letter: letter });
+                matches.push({ num: parseInt(mm[1], 10), letter: mm[2].toUpperCase(), end: mm.index + mm[0].length });
+                starts.push(mm.index);
+            }
+            matches.forEach(function (match, i) {
+                if (match.num >= 101 && match.num <= 130) buckets['5'].push({ num: match.num, letter: match.letter, matchIdx: i });
+                else if (match.num >= 131 && match.num <= 146) buckets['6'].push({ num: match.num, letter: match.letter, matchIdx: i });
+                else if (match.num >= 147 && match.num <= 200) buckets['7'].push({ num: match.num, letter: match.letter, matchIdx: i });
                 // numbers outside 101-200 are ignored — not a real TOEIC
                 // question number, most likely incidental (a date, a dollar
                 // amount, a percentage) inside an explanation string.
-            }
+            });
+            // Trailing text for match i = keyBlock between the end of match i
+            // and the start of match i+1 (or end of block for the last one),
+            // cleaned of a single wrapping "(...)" pair or a leading
+            // separator left over from the pattern above.
+            matches.forEach(function (match, i) {
+                var nextStart = (i + 1 < starts.length) ? starts[i + 1] : keyBlock.length;
+                var raw = keyBlock.slice(match.end, nextStart);
+                raw = raw.replace(/^[\s,:.)-]+/, '');
+                var parenMatch = /^\(([^]*?)\)\s*$/.exec(raw.trim());
+                var cleaned = parenMatch ? parenMatch[1].trim() : raw.trim();
+                // A trailing text under ~3 chars is noise (just punctuation
+                // or whitespace left over), not a real explanation.
+                match.explanation = cleaned.length >= 4 ? cleaned : '';
+            });
             ['5', '6', '7'].forEach(function (p) {
-                // De-duplicate by question number (keep whichever occurrence
-                // sorts in), in case a number is mentioned more than once in
-                // prose (e.g. an explanation that also cross-references
-                // another question) — collapsing to unique numbers first
-                // keeps this safe either way.
-                var byNum = {};
-                buckets[p].forEach(function (x) { byNum[x.num] = x.letter; });
+                var byNum = {}, expByNum = {};
+                buckets[p].forEach(function (x) {
+                    byNum[x.num] = x.letter;
+                    expByNum[x.num] = matches[x.matchIdx].explanation;
+                });
                 var nums = Object.keys(byNum).map(Number).sort(function (a, b) { return a - b; });
                 known[p] = nums.map(function (n) { return byNum[n]; });
+                knownExp[p] = nums.map(function (n) { return expByNum[n] || ''; });
             });
         }
 
@@ -1058,7 +1085,8 @@
             part5Raw: sectionBody(i5, i6),
             part6Raw: sectionBody(i6, i7),
             part7Raw: sectionBody(i7, end7),
-            known: known
+            known: known,
+            knownExp: knownExp
         };
     }
 
@@ -1093,8 +1121,23 @@
             var parsed = parseFullTestMD(text);
             var foundKey = parsed.known['5'].length || parsed.known['6'].length || parsed.known['7'].length;
             var counts = 'Part 5: ' + parsed.known['5'].length + ' answers \u00b7 Part 6: ' + parsed.known['6'].length + ' \u00b7 Part 7: ' + parsed.known['7'].length;
+            // Also report whether real explanations were found alongside the
+            // answers — "every item has one" per part, mirroring the actual
+            // all-or-nothing check used at generation time — so the status
+            // message accurately reflects whether the AI will be asked to
+            // write new explanations or skip that step entirely.
+            function hasFullExp(part) {
+                var exp = parsed.knownExp[part];
+                var ans = parsed.known[part];
+                return ans.length > 0 && exp.length === ans.length &&
+                    exp.every(function (e) { return e && e.trim().length >= 4; });
+            }
+            var expParts = ['5', '6', '7'].filter(hasFullExp);
+            var expNote = expParts.length
+                ? ' Explanations already found for ' + expParts.map(function (p) { return 'Part ' + p; }).join(', ') + ' \u2014 the AI will not write new ones for ' + (expParts.length === 3 ? 'any part' : 'those') + ', saving output tokens.'
+                : '';
             var msg = foundKey
-                ? '<i class="fa-solid fa-circle-check" style="color:#22c55e;"></i> Parts 5/6/7 detected. Answer key found (' + counts + ') \u2014 the AI will only format and explain, not solve.'
+                ? '<i class="fa-solid fa-circle-check" style="color:#22c55e;"></i> Parts 5/6/7 detected. Answer key found (' + counts + ') \u2014 the AI will only format' + (expParts.length ? '' : ' and explain') + ', not solve.' + expNote
                 : '<i class="fa-solid fa-circle-exclamation" style="color:var(--amber-600);"></i> Parts 5/6/7 detected, but no answer key section was found \u2014 the AI will solve as usual.';
             statusEl.innerHTML = msg;
             if (mdStatusEl) mdStatusEl.innerHTML = msg;
@@ -1108,6 +1151,20 @@
     function buildAnswersFromKnown(startNum, letters) {
         var out = {};
         for (var i = 0; i < letters.length; i++) out['q' + (startNum + i)] = [letters[i]];
+        return out;
+    }
+
+    // Mirrors buildAnswersFromKnown: when the pasted answer key already had
+    // real explanation text next to each answer (extracted client-side by
+    // parseFullTestMD), build the EXPLANATIONS object directly from that
+    // text instead of asking the AI to write new ones — using text that
+    // already exists and was thrown away, only to have the AI regenerate an
+    // equivalent version, wastes output tokens for no benefit.
+    function buildExplanationsFromKnown(startNum, explanations) {
+        var out = {};
+        for (var i = 0; i < explanations.length; i++) {
+            if (explanations[i]) out['q' + (startNum + i)] = explanations[i];
+        }
         return out;
     }
 
@@ -1127,14 +1184,24 @@
         return out;
     }
 
-    async function solvePart5Manual(level, startNum, raw, knownLetters) {
+    async function solvePart5Manual(level, startNum, raw, knownLetters, knownExplanations) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 5: paste box is empty.');
         var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
+        // Only trust "explanations already provided" when EVERY item has one
+        // — a partial set would mean mixing AI-written and source-written
+        // explanations, which risks a style mismatch worse than just asking
+        // the AI to write all of them consistently.
+        var useKnownExp = useKnown && Array.isArray(knownExplanations) &&
+            knownExplanations.length === knownLetters.length &&
+            knownExplanations.every(function (e) { return e && e.trim().length >= 4; });
 
         var prompt =
             'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 5 (Incomplete Sentences) content copied from a book or website, so its formatting may be messy (line breaks in the middle of sentences, blanks shown as runs of dashes or underscores, options labelled (A)(B)(C)(D) or A. B. C. D.). Do NOT write new questions.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'The correct answer AND its explanation for every item are ALREADY VERIFIED and given below, in the SAME order the items appear in the paste. Do NOT re-derive, second-guess, or change any answer, and do NOT write your own explanations \u2014 explanations are already provided and will be attached separately. Your ONLY job is to convert the pasted content into clean interactive HTML in the exact item order given.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' items, for your reference only): ' + knownLetters.join(', ') + '\n\n'
+                : useKnown
                 ? 'The correct answer for every item is ALREADY VERIFIED and given below, in the SAME order the items appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean interactive HTML in the exact item order given, and (2) write a short Vietnamese explanation for each item justifying the GIVEN correct answer.\n\n' +
                   'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' items): ' + knownLetters.join(', ') + '\n\n'
                 : 'Faithfully convert EXACTLY what is pasted into clean interactive HTML, then solve every item with perfect accuracy.\n\n') +
@@ -1155,7 +1222,11 @@
             '  </div>\n' +
             '</div>\n' +
             'Increment the number, data-q and input name (q' + startNum + ', q' + (startNum + 1) + ', \u2026) for each item in order.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
+                  '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
+                  '===GG_END===\n'
+                : useKnown
                 ? 'EXPLANATIONS: JSON object, one entry per item, KEYED EXACTLY like the input names above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026) \u2014 same keys as the radio button "name" attributes you just wrote. Value = 1 short sentence WRITTEN IN VIETNAMESE (ti\u1EBFng Vi\u1EC7t) naming the grammar/vocabulary point and explaining why the GIVEN answer is correct and the other three are wrong. Keep the tested English words in English inside the Vietnamese sentence. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 use these exact marker lines, nothing before the first or after the last, no markdown/code fences:\n\n' +
                   '===GG_ITEMS===\nthe items HTML here (NOT parsed as JSON)\n' +
@@ -1172,15 +1243,21 @@
                   'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return useKnown
+            return useKnownExp
+                ? htmlBlockComplete(t, '===GG_ITEMS===', '===GG_END===', 300)
+                : useKnown
                 ? htmlBlockComplete(t, '===GG_ITEMS===', '===GG_EXPLANATIONS===', 300)
                 : (htmlBlockComplete(t, '===GG_ITEMS===', '===GG_ANSWERS===', 300) &&
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
+        var text = await callClaude(prompt, useKnownExp ? 10000 : 16000, 1, salvage, QUESTION_EFFORT);
         var items, answers, exps;
-        if (useKnown) {
+        if (useKnownExp) {
+            items   = grabBlock(text, '===GG_ITEMS===', '===GG_END===');
+            answers = buildAnswersFromKnown(startNum, knownLetters);
+            exps    = buildExplanationsFromKnown(startNum, knownExplanations);
+        } else if (useKnown) {
             items   = grabBlock(text, '===GG_ITEMS===', '===GG_EXPLANATIONS===');
             exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers = buildAnswersFromKnown(startNum, knownLetters);
@@ -1195,14 +1272,20 @@
         return { questions: items, answers: answers, explanations: exps };
     }
 
-    async function solvePart6Manual(level, startNum, raw, knownLetters) {
+    async function solvePart6Manual(level, startNum, raw, knownLetters, knownExplanations) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 6: paste box is empty.');
         var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
+        var useKnownExp = useKnown && Array.isArray(knownExplanations) &&
+            knownExplanations.length === knownLetters.length &&
+            knownExplanations.every(function (e) { return e && e.trim().length >= 4; });
 
         var prompt =
             'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 6 (Text Completion) content copied from a book or website, so formatting may be messy. Each text has numbered blanks; some blanks are single words/phrases with four options, and (in modern TOEIC) one blank per text is a "insert the best sentence" item with four full-sentence options. Do NOT write new texts.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'The correct answer AND its explanation for every blank are ALREADY VERIFIED and given below, in the SAME order the blanks appear in the paste. Do NOT re-derive, second-guess, or change any answer, and do NOT write your own explanations \u2014 explanations are already provided and will be attached separately. Your ONLY job is to convert the pasted content into clean interactive HTML in the exact blank order given.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' blanks, for your reference only): ' + knownLetters.join(', ') + '\n\n'
+                : useKnown
                 ? 'The correct answer for every blank is ALREADY VERIFIED and given below, in the SAME order the blanks appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean interactive HTML in the exact blank order given, and (2) write a short Vietnamese explanation for each blank justifying the GIVEN correct answer.\n\n' +
                   'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' blanks): ' + knownLetters.join(', ') + '\n\n'
                 : 'Convert EXACTLY what is pasted into clean interactive HTML, then solve every blank accurately.\n\n') +
@@ -1221,7 +1304,11 @@
             '  <div class="p6-sentence-q"><p class="mcq-stem"><b>N.</b> Which sentence best completes the text?</p><div class="mcq-opts"><label><input type="radio" name="qN" value="A"> (A) sentence</label> ... four options ...</div></div>\n' +
             '</div>\n' +
             'Repeat for each text (data-text 1,2,3,\u2026). Every <select> option value MUST be only the letter A/B/C/D.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
+                  '===GG_END===\n'
+                : useKnown
                 ? 'EXPLANATIONS: JSON object, one entry per blank, KEYED EXACTLY like the select/input "name" attributes above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026). Value = 1 short sentence WRITTEN IN VIETNAMESE justifying the GIVEN correct answer from the surrounding text; keep quoted English words in English. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_TEXTS===\nthe texts HTML here (NOT parsed as JSON)\n' +
@@ -1238,15 +1325,21 @@
                   'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return useKnown
+            return useKnownExp
+                ? htmlBlockComplete(t, '===GG_TEXTS===', '===GG_END===', 300)
+                : useKnown
                 ? htmlBlockComplete(t, '===GG_TEXTS===', '===GG_EXPLANATIONS===', 300)
                 : (htmlBlockComplete(t, '===GG_TEXTS===', '===GG_ANSWERS===', 300) &&
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text = await callClaude(prompt, 16000, 1, salvage, QUESTION_EFFORT);
+        var text = await callClaude(prompt, useKnownExp ? 10000 : 16000, 1, salvage, QUESTION_EFFORT);
         var texts, answers, exps;
-        if (useKnown) {
+        if (useKnownExp) {
+            texts   = grabBlock(text, '===GG_TEXTS===', '===GG_END===');
+            answers = buildAnswersFromKnown(startNum, knownLetters);
+            exps    = buildExplanationsFromKnown(startNum, knownExplanations);
+        } else if (useKnown) {
             texts   = grabBlock(text, '===GG_TEXTS===', '===GG_EXPLANATIONS===');
             exps    = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers = buildAnswersFromKnown(startNum, knownLetters);
@@ -1265,14 +1358,20 @@
     // solves. Returned as a single "single-passage" style group so the export's
     // Part 7 renderer shows it in the dual-pane layout without needing the
     // single/double/triple batching (which only matters for AI authoring).
-    async function solvePart7Manual(level, startNum, raw, knownLetters) {
+    async function solvePart7Manual(level, startNum, raw, knownLetters, knownExplanations) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 7: paste box is empty.');
         var useKnown = Array.isArray(knownLetters) && knownLetters.length > 0;
+        var useKnownExp = useKnown && Array.isArray(knownExplanations) &&
+            knownExplanations.length === knownLetters.length &&
+            knownExplanations.every(function (e) { return e && e.trim().length >= 4; });
 
         var prompt =
             'You are an expert TOEIC test formatter. Below is pasted TOEIC Reading PART 7 (Reading Comprehension) content copied from a book or website \u2014 one or more reading passages/documents, each followed by its comprehension questions with four options. Do NOT write new passages or new questions.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'The correct answer AND its explanation for every question are ALREADY VERIFIED and given below, in the SAME order the questions appear in the paste. Do NOT re-derive, second-guess, or change any answer, and do NOT write your own explanations \u2014 explanations are already provided and will be attached separately. Your ONLY job is to convert the pasted content into clean HTML in the exact question order given.\n\n' +
+                  'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' questions, for your reference only): ' + knownLetters.join(', ') + '\n\n'
+                : useKnown
                 ? 'The correct answer for every question is ALREADY VERIFIED and given below, in the SAME order the questions appear in the paste. Do NOT re-derive, second-guess, or change any answer — copy them exactly as given. Your only job is to (1) convert the pasted content into clean HTML in the exact question order given, and (2) write a Vietnamese explanation for each question justifying the GIVEN correct answer.\n\n' +
                   'VERIFIED ANSWERS IN ORDER (' + knownLetters.length + ' questions): ' + knownLetters.join(', ') + '\n\n'
                 : 'Convert EXACTLY what is pasted into clean HTML, then solve every question accurately.\n\n') +
@@ -1290,7 +1389,12 @@
             '  <div class="mcq-item" data-q="' + startNum + '"><p class="mcq-stem"><b>' + startNum + '.</b> question</p><div class="mcq-opts"><label><input type="radio" name="q' + startNum + '" value="A"> (A) option</label> ... four options ...</div></div>\n' +
             '  \u2026 more items \u2026\n</div>\n' +
             'Repeat the toeic-qset per set, matching data-set to the passages.\n\n' +
-            (useKnown
+            (useKnownExp
+                ? 'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
+                  '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
+                  '===GG_QUESTIONS===\nthe questions HTML here (NOT parsed as JSON)\n' +
+                  '===GG_END===\n'
+                : useKnown
                 ? 'EXPLANATIONS: JSON object, one entry per question, KEYED EXACTLY like the radio "name" attributes above (e.g. "q' + startNum + '", "q' + (startNum + 1) + '", \u2026). Value = 1\u20132 sentences WRITTEN IN VIETNAMESE naming which document/detail proves the GIVEN correct answer; keep quoted English in English. Example: {"q' + startNum + '": "..."}\n\n' +
                   'OUTPUT \u2014 exact marker lines, nothing before/after, no markdown:\n\n' +
                   '===GG_PASSAGES===\nthe passages HTML here (NOT parsed as JSON)\n' +
@@ -1309,7 +1413,10 @@
                   'Inside the ANSWERS and EXPLANATIONS blocks only, escape any double quote as \\" and use \\n instead of a real newline.');
 
         function salvage(t) {
-            return useKnown
+            return useKnownExp
+                ? (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
+                   htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_END===', 200))
+                : useKnown
                 ? (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
                    htmlBlockComplete(t, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===', 200))
                 : (htmlBlockComplete(t, '===GG_PASSAGES===', '===GG_QUESTIONS===', 200) &&
@@ -1317,10 +1424,14 @@
                    answersBlockComplete(t, '===GG_ANSWERS===', '===GG_EXPLANATIONS==='));
         }
 
-        var text = await callClaude(prompt, 32000, 1, salvage, QUESTION_EFFORT);
+        var text = await callClaude(prompt, useKnownExp ? 24000 : 32000, 1, salvage, QUESTION_EFFORT);
         var passages = grabBlock(text, '===GG_PASSAGES===', '===GG_QUESTIONS===');
         var questions, answers, exps;
-        if (useKnown) {
+        if (useKnownExp) {
+            questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_END===');
+            answers   = buildAnswersFromKnown(startNum, knownLetters);
+            exps      = buildExplanationsFromKnown(startNum, knownExplanations);
+        } else if (useKnown) {
             questions = grabBlock(text, '===GG_QUESTIONS===', '===GG_EXPLANATIONS===');
             exps      = normalizeExplanationKeys(safeJSONObject(grabBlock(text, '===GG_EXPLANATIONS===', '===GG_END===')) || {});
             answers   = buildAnswersFromKnown(startNum, knownLetters);
@@ -1618,6 +1729,9 @@
             KNOWN_ANSWERS['5'] = parsed.known['5'].length ? parsed.known['5'] : null;
             KNOWN_ANSWERS['6'] = parsed.known['6'].length ? parsed.known['6'] : null;
             KNOWN_ANSWERS['7'] = parsed.known['7'].length ? parsed.known['7'] : null;
+            KNOWN_EXPLANATIONS['5'] = parsed.knownExp['5'].length ? parsed.knownExp['5'] : null;
+            KNOWN_EXPLANATIONS['6'] = parsed.knownExp['6'].length ? parsed.knownExp['6'] : null;
+            KNOWN_EXPLANATIONS['7'] = parsed.knownExp['7'].length ? parsed.knownExp['7'] : null;
             var missing = parts.filter(function (p) { return !MANUAL_TEXT[p].trim(); });
             if (missing.length) {
                 log('Manual mode: could not find content for ' + missing.map(function (p) { return 'Part ' + p; }).join(', ') + ' \u2014 check the pasted text.', 'err');
@@ -1639,8 +1753,10 @@
             if (parts.indexOf('5') !== -1) {
                 var p5;
                 if (MODE === 'manual') {
-                    log(KNOWN_ANSWERS['5'] ? 'Part 5 \u2014 formatting your pasted items (answers already verified)\u2026' : 'Part 5 \u2014 formatting and solving your pasted items\u2026');
-                    p5 = await solvePart5Manual(LEVEL, PART5_START, MANUAL_TEXT['5'], KNOWN_ANSWERS['5']);
+                    log(KNOWN_ANSWERS['5']
+                        ? (KNOWN_EXPLANATIONS['5'] ? 'Part 5 \u2014 formatting your pasted items (answers + explanations already verified)\u2026' : 'Part 5 \u2014 formatting your pasted items (answers already verified)\u2026')
+                        : 'Part 5 \u2014 formatting and solving your pasted items\u2026');
+                    p5 = await solvePart5Manual(LEVEL, PART5_START, MANUAL_TEXT['5'], KNOWN_ANSWERS['5'], KNOWN_EXPLANATIONS['5']);
                 } else {
                     log('Part 5 \u2014 writing and solving 30 items\u2026');
                     p5 = await generatePart5(LEVEL, PART5_START, 30);
@@ -1655,8 +1771,10 @@
             if (parts.indexOf('6') !== -1) {
                 var p6;
                 if (MODE === 'manual') {
-                    log(KNOWN_ANSWERS['6'] ? 'Part 6 \u2014 formatting your pasted texts (answers already verified)\u2026' : 'Part 6 \u2014 formatting and solving your pasted texts\u2026');
-                    p6 = await solvePart6Manual(LEVEL, PART6_START, MANUAL_TEXT['6'], KNOWN_ANSWERS['6']);
+                    log(KNOWN_ANSWERS['6']
+                        ? (KNOWN_EXPLANATIONS['6'] ? 'Part 6 \u2014 formatting your pasted texts (answers + explanations already verified)\u2026' : 'Part 6 \u2014 formatting your pasted texts (answers already verified)\u2026')
+                        : 'Part 6 \u2014 formatting and solving your pasted texts\u2026');
+                    p6 = await solvePart6Manual(LEVEL, PART6_START, MANUAL_TEXT['6'], KNOWN_ANSWERS['6'], KNOWN_EXPLANATIONS['6']);
                 } else {
                     log('Part 6 \u2014 writing 4 texts and solving 16 blanks\u2026');
                     p6 = await generatePart6(LEVEL, PART6_START, 4);
@@ -1671,8 +1789,10 @@
 
             if (parts.indexOf('7') !== -1) {
                 if (MODE === 'manual') {
-                    log(KNOWN_ANSWERS['7'] ? 'Part 7 \u2014 formatting your pasted passages (answers already verified)\u2026' : 'Part 7 \u2014 formatting and solving your pasted passages\u2026');
-                    var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7'], KNOWN_ANSWERS['7']);
+                    log(KNOWN_ANSWERS['7']
+                        ? (KNOWN_EXPLANATIONS['7'] ? 'Part 7 \u2014 formatting your pasted passages (answers + explanations already verified)\u2026' : 'Part 7 \u2014 formatting your pasted passages (answers already verified)\u2026')
+                        : 'Part 7 \u2014 formatting and solving your pasted passages\u2026');
+                    var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7'], KNOWN_ANSWERS['7'], KNOWN_EXPLANATIONS['7']);
                     var mg = m7.groups.single;
                     var fm = renumber(mg.questions, mg.answers, mg.explanations, PART7_START);
                     var em = ensureInputs(fm.questions, fm.answers);
