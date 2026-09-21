@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;700;800&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         :root {
             --navy-950:#0e2440; --navy-800:#173b64; --blue-700:#1f5f96; --blue-500:#3f86bd;
@@ -196,8 +197,9 @@
             <div class="field-hint">Dán toàn bộ đề bên dưới (Part 5 + 6 + 7, kèm đáp án nếu có) hoặc tải lên file <b>.md/.txt</b> &mdash; AI tự nhận diện từng phần. Nếu tìm thấy đáp án đã kiểm tra, AI <b>bỏ qua bước giải</b> và chỉ định dạng + giải thích &mdash; tiết kiệm nhất. (Paste the whole test or upload a file &mdash; auto-detected. If a verified answer key is found, the AI skips solving entirely.)</div>
 
             <div id="uploadMdBox" class="paste-box" style="border:1.5px dashed var(--border);border-radius:10px;padding:16px;background:#fafcfe;">
-                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt" onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
+                <input type="file" id="mdUploadInput" accept=".md,.markdown,.txt,.zip" multiple onchange="handleMdUpload(event)" style="font-family:inherit;font-size:0.82rem;">
                 <div id="mdUploadStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:8px;line-height:1.5;"></div>
+                <div id="batchQueueStatus" style="font-size:0.78rem;color:var(--text-sub);margin-top:6px;line-height:1.5;"></div>
             </div>
 
             <div class="paste-box">
@@ -966,6 +968,14 @@
 
     var MANUAL_TEXT = { '5': '', '6': '', '7': '' };
 
+    // Batch queue: when the file picker yields more than one .md/.txt (or a
+    // .zip of them), each entry's raw text is run through the normal manual
+    // pipeline one at a time via buildToeicBatch() below, instead of loading
+    // everything into the single paste textarea.
+    var BATCH_QUEUE = [];   // [{ name, text }, ...]
+    var BATCH_LABEL = null; // current file's name, while a batch run is in progress
+    var LAST_BUILD_OK = false;
+
     // Known-good answers extracted from an uploaded full-test .md file, keyed
     // by part. When set (non-null array of letters, in pasted order), the
     // solve*Manual functions below skip asking the AI to derive answers at
@@ -1091,20 +1101,122 @@
     }
 
     function handleMdUpload(evt) {
-        var file = evt.target.files && evt.target.files[0];
+        var files = evt.target.files ? Array.prototype.slice.call(evt.target.files) : [];
         var statusEl = document.getElementById('mdUploadStatus');
-        if (!file) return;
-        var reader = new FileReader();
-        reader.onload = function (e) {
-            document.getElementById('pasteFullText').value = e.target.result;
-            if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
-            log('Uploaded "' + file.name + '" \u2014 checking format\u2026');
-            onFullPasteInput();
-        };
-        reader.onerror = function () {
-            statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Could not read that file.';
-        };
-        reader.readAsText(file);
+        var batchEl = document.getElementById('batchQueueStatus');
+        if (!files.length) return;
+
+        // A single non-zip file keeps the original behaviour exactly: load
+        // straight into the paste box for the normal one-off flow.
+        if (files.length === 1 && !/\.zip$/i.test(files[0].name)) {
+            BATCH_QUEUE = [];
+            if (batchEl) batchEl.innerHTML = '';
+            var file = files[0];
+            var reader = new FileReader();
+            reader.onload = function (e) {
+                document.getElementById('pasteFullText').value = e.target.result;
+                if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
+                log('Uploaded "' + file.name + '" \u2014 checking format\u2026');
+                onFullPasteInput();
+            };
+            reader.onerror = function () {
+                statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> Could not read that file.';
+            };
+            reader.readAsText(file);
+            return;
+        }
+
+        // Multiple files and/or a .zip: build a batch queue. Each test is
+        // generated and downloaded one at a time by buildToeicBatch().
+        if (typeof MODE !== 'undefined' && MODE !== 'manual') setMode('manual');
+        statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Reading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '\u2026';
+
+        function readAsText(f) {
+            return new Promise(function (resolve, reject) {
+                var r = new FileReader();
+                r.onload = function (e) { resolve(e.target.result); };
+                r.onerror = reject;
+                r.readAsText(f);
+            });
+        }
+
+        var jobs = files.map(function (f) {
+            if (/\.zip$/i.test(f.name)) {
+                if (typeof JSZip === 'undefined') {
+                    log('Could not read "' + f.name + '" \u2014 the .zip helper library failed to load (check your connection).', 'err');
+                    return Promise.resolve([]);
+                }
+                return JSZip.loadAsync(f).then(function (zip) {
+                    var entries = Object.keys(zip.files).filter(function (name) {
+                        return /\.(md|markdown|txt)$/i.test(name) && !zip.files[name].dir &&
+                               name.indexOf('__MACOSX') === -1 && name.indexOf('/.') === -1;
+                    });
+                    return Promise.all(entries.map(function (name) {
+                        return zip.files[name].async('string').then(function (text) {
+                            return { name: name.replace(/^.*\//, ''), text: text };
+                        });
+                    }));
+                }).catch(function (err) {
+                    log('Could not open "' + f.name + '" as a .zip: ' + err.message, 'err');
+                    return [];
+                });
+            }
+            return readAsText(f).then(function (text) { return [{ name: f.name, text: text }]; })
+                .catch(function () {
+                    log('Could not read "' + f.name + '".', 'err');
+                    return [];
+                });
+        });
+
+        Promise.all(jobs).then(function (groups) {
+            var items = [].concat.apply([], groups).filter(function (it) { return it.text && it.text.trim(); });
+            items.sort(function (a, b) { return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }); });
+            BATCH_QUEUE = items;
+            if (!items.length) {
+                statusEl.innerHTML = '<i class="fa-solid fa-circle-xmark" style="color:#dc2626;"></i> No readable .md/.txt content found.';
+                if (batchEl) batchEl.innerHTML = '';
+                return;
+            }
+            statusEl.innerHTML = '<i class="fa-solid fa-circle-check" style="color:#16a34a;"></i> ' + items.length + ' test' + (items.length > 1 ? 's' : '') + ' queued for batch generation.';
+            if (batchEl) {
+                batchEl.innerHTML = '<b>Batch queue (' + items.length + '):</b> ' + items.map(function (it) { return it.name; }).join(', ');
+            }
+            log('Batch \u2014 ' + items.length + ' file' + (items.length > 1 ? 's' : '') + ' queued: ' + items.map(function (it) { return it.name; }).join(', '));
+        });
+    }
+
+    // Runs the existing manual buildToeicTest() pipeline once per queued
+    // file, feeding each file's raw text through the paste box in turn so
+    // every existing part-5/6/7 parsing and Part-7 single/double/triple
+    // grouping logic is reused unchanged. Each file downloads as its own
+    // export; one file's failure is logged and skipped, not fatal to the
+    // rest of the batch.
+    async function buildToeicBatch() {
+        var queue = BATCH_QUEUE.slice();
+        var total = queue.length;
+        log('\u2550\u2550 Batch start \u2014 ' + total + ' test' + (total > 1 ? 's' : '') + ' \u2550\u2550');
+        var ok = 0, failed = [];
+        for (var i = 0; i < total; i++) {
+            var item = queue[i];
+            var label = item.name.replace(/\.(md|markdown|txt)$/i, '');
+            log('\u2500\u2500 File ' + (i + 1) + '/' + total + ': ' + item.name + ' \u2500\u2500');
+            document.getElementById('pasteFullText').value = item.text;
+            BATCH_LABEL = label;
+            LAST_BUILD_OK = false;
+            try {
+                await buildToeicTest();
+            } catch (e) {
+                log('File "' + item.name + '" failed: ' + e.message, 'err');
+            }
+            if (LAST_BUILD_OK) { ok++; } else { failed.push(item.name); }
+            if (i < total - 1) await sleep(800);
+        }
+        BATCH_LABEL = null;
+        BATCH_QUEUE = [];
+        var batchEl = document.getElementById('batchQueueStatus');
+        if (batchEl) batchEl.innerHTML = '';
+        log('\u2550\u2550 Batch done \u2014 ' + ok + '/' + total + ' succeeded' +
+            (failed.length ? ' \u2014 failed: ' + failed.join(', ') : '') + ' \u2550\u2550', failed.length ? 'err' : 'ok');
     }
 
     // Live preview as the person pastes/types or right after a file loads —
@@ -1113,6 +1225,14 @@
     // buildToeicTest(), so editing the text after this preview is always
     // respected.
     function onFullPasteInput() {
+        // Manual edits to the paste box mean the person is back to a single
+        // test; drop any leftover batch queue from an earlier multi-file
+        // upload so Generate doesn't silently run a stale batch instead.
+        if (!BATCH_LABEL && BATCH_QUEUE.length) {
+            BATCH_QUEUE = [];
+            var batchEl = document.getElementById('batchQueueStatus');
+            if (batchEl) batchEl.innerHTML = '';
+        }
         var statusEl = document.getElementById('pasteFullStatus');
         var mdStatusEl = document.getElementById('mdUploadStatus');
         var text = document.getElementById('pasteFullText').value;
@@ -1354,10 +1474,96 @@
         return { questions: texts, answers: answers, explanations: exps };
     }
 
+    // Splits a manually-pasted Part 7 submission into single/double/triple
+    // groups by counting the .toeic-doc blocks inside each .toeic-set the
+    // model actually produced. This reads the STRUCTURE Claude built (data-set
+    // markers + doc count), never markdown or any other formatting mark in the
+    // original paste, so it works the same whether the source .md was plain
+    // text or fully marked-up — that source formatting never reaches this step.
+    function splitPart7ManualGroups(passages, questions, answers, explanations) {
+        // A set is sliced out by string position (from one "data-set" marker
+        // to the next), not by matching tags — so if the model left a <div>
+        // unclosed anywhere inside that one set, the slice itself is
+        // unbalanced and would otherwise swallow whatever set follows it
+        // once sets are concatenated back together. Force each slice closed
+        // on its own so one set's stray tag can never nest into the next.
+        function balanceDivs(html) {
+            var re = /<div\b[^>]*>|<\/div>/gi;
+            var depth = 0, result = '', lastIndex = 0, m;
+            while ((m = re.exec(html)) !== null) {
+                var isClose = /^<\/div>/i.test(m[0]);
+                result += html.slice(lastIndex, m.index);
+                lastIndex = re.lastIndex;
+                if (isClose) {
+                    if (depth > 0) { result += m[0]; depth--; }
+                    // else: a stray extra </div> with no open of its own in
+                    // this slice — drop it rather than let it close a piece
+                    // of the OUTER layout (e.g. the next passage set, or the
+                    // group panel itself) early.
+                } else {
+                    result += m[0];
+                    depth++;
+                }
+            }
+            result += html.slice(lastIndex);
+            if (depth > 0) result += new Array(depth + 1).join('</div>');
+            return result;
+        }
+
+        function splitBlocks(html, cls) {
+            var re = new RegExp('<div class="' + cls + '" data-set="(\\d+)">', 'g');
+            var marks = [], m;
+            while ((m = re.exec(html)) !== null) marks.push({ set: m[1], start: m.index });
+            var blocks = {};
+            marks.forEach(function (mk, i) {
+                var end = (i + 1 < marks.length) ? marks[i + 1].start : html.length;
+                blocks[mk.set] = balanceDivs(html.slice(mk.start, end));
+            });
+            return blocks;
+        }
+
+        var passageBlocks  = splitBlocks(passages, 'toeic-set');
+        var questionBlocks = splitBlocks(questions, 'toeic-qset');
+        var setNums = Object.keys(passageBlocks).sort(function (a, b) { return (+a) - (+b); });
+
+        // Fallback: no recognizable data-set markers at all — keep the old
+        // single-blob behaviour rather than losing content.
+        if (!setNums.length) {
+            return { single: { label: 'Reading Passages', passages: passages, questions: questions, answers: answers, explanations: explanations } };
+        }
+
+        var buckets = { single: [], double: [], triple: [] };
+        setNums.forEach(function (num) {
+            var pBlock = passageBlocks[num] || '';
+            var qBlock = questionBlocks[num] || '';
+            var docCount = (pBlock.match(/class="toeic-doc"/g) || []).length || 1;
+            var kind = docCount >= 3 ? 'triple' : docCount === 2 ? 'double' : 'single';
+            buckets[kind].push({ passages: pBlock, questions: qBlock });
+        });
+
+        var LABELS = { single: 'Single Passages', double: 'Double Passages', triple: 'Triple Passages' };
+        var groups = {};
+        ['single', 'double', 'triple'].forEach(function (kind) {
+            var items = buckets[kind];
+            if (!items.length) return;
+            var pHTML = items.map(function (it) { return it.passages; }).join('\n');
+            var qHTML = items.map(function (it) { return it.questions; }).join('\n');
+            var ids = [], seen = {}, m, re = /name\s*=\s*"([^"]+)"/g;
+            while ((m = re.exec(qHTML)) !== null) { if (!seen[m[1]]) { seen[m[1]] = true; ids.push(m[1]); } }
+            var ans = {}, exp = {};
+            ids.forEach(function (id) {
+                if (answers[id] !== undefined) ans[id] = answers[id];
+                if (explanations && explanations[id] !== undefined) exp[id] = explanations[id];
+            });
+            groups[kind] = { label: LABELS[kind], passages: pHTML, questions: qHTML, answers: ans, explanations: exp };
+        });
+        return groups;
+    }
+
     // Part 7 manual: paste passages AND their questions. AI structures both and
-    // solves. Returned as a single "single-passage" style group so the export's
-    // Part 7 renderer shows it in the dual-pane layout without needing the
-    // single/double/triple batching (which only matters for AI authoring).
+    // solves, then splitPart7ManualGroups() above sorts the result into
+    // single/double/triple groups so the export shows the same sub-tabbed
+    // dual-pane layout as an AI-authored Part 7.
     async function solvePart7Manual(level, startNum, raw, knownLetters, knownExplanations) {
         var body = tidyPaste(raw);
         if (!body) throw new Error('Part 7: paste box is empty.');
@@ -1445,16 +1651,9 @@
         if (!questions) throw new Error('Part 7: could not read the questions from your paste.');
         if (!Object.keys(answers).length) throw new Error('Part 7: could not solve the answer key.');
 
-        // Present as a single group so the Part-7 renderer shows one dual-pane set.
-        return {
-            groups: {
-                single: {
-                    label: 'Reading Passages', passages: passages, questions: questions,
-                    answers: answers, explanations: exps, first: startNum, last: startNum
-                }
-            },
-            first: startNum, last: startNum
-        };
+        // Sort into single/double/triple groups by actual .toeic-doc counts.
+        var grouped = splitPart7ManualGroups(passages, questions, answers, exps);
+        return { groups: grouped, first: startNum, last: startNum };
     }
 
     /* =====================================================================
@@ -1708,6 +1907,10 @@
             return;
         }
 
+        if (MODE === 'manual' && BATCH_QUEUE.length && !BATCH_LABEL) {
+            return buildToeicBatch();
+        }
+
         var parts = ['5', '6', '7'];
 
         if (MODE === 'manual') {
@@ -1793,18 +1996,21 @@
                         ? (KNOWN_EXPLANATIONS['7'] ? 'Part 7 \u2014 formatting your pasted passages (answers + explanations already verified)\u2026' : 'Part 7 \u2014 formatting your pasted passages (answers already verified)\u2026')
                         : 'Part 7 \u2014 formatting and solving your pasted passages\u2026');
                     var m7 = await solvePart7Manual(LEVEL, PART7_START, MANUAL_TEXT['7'], KNOWN_ANSWERS['7'], KNOWN_EXPLANATIONS['7']);
-                    var mg = m7.groups.single;
-                    var fm = renumber(mg.questions, mg.answers, mg.explanations, PART7_START);
-                    var em = ensureInputs(fm.questions, fm.answers);
-                    testData.part7 = {
-                        groups: { single: {
+                    var mOrder = ['single', 'double', 'triple'].filter(function (gt) { return m7.groups[gt]; });
+                    var mGroups = {}, mCursor = PART7_START;
+                    mOrder.forEach(function (gt) {
+                        var mg = m7.groups[gt];
+                        var fm = renumber(mg.questions, mg.answers, mg.explanations, mCursor);
+                        var em = ensureInputs(fm.questions, fm.answers);
+                        mGroups[gt] = {
                             label: mg.label, passages: mg.passages, questions: em.questions,
                             answers: fm.answers, explanations: fm.explanations,
-                            first: PART7_START, last: PART7_START + fm.count - 1
-                        } },
-                        first: PART7_START, last: PART7_START + fm.count - 1
-                    };
-                    log('Part 7 ready \u00b7 ' + fm.count + ' questions (' + PART7_START + '\u2013' + (PART7_START + fm.count - 1) + ').', 'ok');
+                            first: mCursor, last: mCursor + fm.count - 1
+                        };
+                        mCursor += fm.count;
+                    });
+                    testData.part7 = { groups: mGroups, first: PART7_START, last: mCursor - 1 };
+                    log('Part 7 ready \u00b7 ' + (mCursor - PART7_START) + ' questions (' + PART7_START + '\u2013' + (mCursor - 1) + ').', 'ok');
                 } else {
                     var groups = {}, order = ['single', 'double', 'triple'], cursor = PART7_START;
                     for (var i = 0; i < order.length; i++) {
@@ -1826,7 +2032,7 @@
                 }
             }
 
-            var testTitle = 'GG Languages Academy - TOEIC Reading Test';
+            var testTitle = 'GG Languages Academy - TOEIC Reading Test' + (BATCH_LABEL ? ' - ' + BATCH_LABEL : '');
 
             log('Packaging student file\u2026');
             var totalQ = (testData.part5 ? testData.part5.last - testData.part5.first + 1 : 0) +
@@ -1834,9 +2040,11 @@
                          (testData.part7 ? testData.part7.last - testData.part7.first + 1 : 0);
             exportToeicFile(testTitle, testData, totalQ);
             log('SUCCESS \u2014 ' + totalQ + ' questions. File downloaded.', 'ok');
+            LAST_BUILD_OK = true;
 
         } catch (e) {
             log('ERROR: ' + e.message, 'err');
+            LAST_BUILD_OK = false;
         } finally {
             selectors.forEach(function (b) { b.disabled = false; });
             btn.disabled = false;
