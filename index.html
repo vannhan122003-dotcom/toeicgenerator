@@ -1035,7 +1035,10 @@
         // explanation, a colon-explanation, a bare line break, Vietnamese
         // text, anything). The separator between number and letter is also
         // tolerant of the styles actually seen so far: dash, period, colon,
-        // or a closing parenthesis.
+        // or a closing parenthesis — and the letter itself may optionally be
+        // wrapped in its own parentheses ("101. (B)"), which is the answer
+        // key style this tool's own explanations use, so it must recognize
+        // its own output as well as plainer "101-B" / "101: B" styles.
         //
         // Alongside the letter, also capture whatever text sits between this
         // answer and the next one — if the source already wrote out a real
@@ -1049,7 +1052,7 @@
         if (iKey >= 0) {
             var keyBlock = md.slice(iKey);
             var buckets = { '5': [], '6': [], '7': [] };
-            var pairRe = /(\d{2,3})\s*[-.:)]\s*([A-D])\b/gi;
+            var pairRe = /(\d{2,3})\s*[-.:)]\s*\(?([A-D])\)?\b/gi;
             var matches = [];
             var starts = [];
             var mm;
