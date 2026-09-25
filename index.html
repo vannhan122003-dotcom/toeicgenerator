@@ -883,6 +883,21 @@
         return String(html || '').replace(/<[^>]+>/g, ' ').split(/\s+/).filter(Boolean).length;
     }
 
+    // Part 7 passage pane never carried its own "Questions N-M" heading —
+    // only the quiz pane did (via the qset-label the AI is told to write).
+    // Rather than trust the AI to also write a matching one on the passage
+    // side, mirror the quiz pane's already-correct, already-renumbered
+    // label onto each passage block after the fact.
+    function injectPassageQLabels(passagesHTML, questionsHTML) {
+        var labels = {}, m;
+        var re = /<div class="toeic-qset" data-set="(\d+)">\s*<p class="qset-label"><b>(.*?)<\/b><\/p>/g;
+        while ((m = re.exec(questionsHTML)) !== null) labels[m[1]] = m[2];
+        if (!Object.keys(labels).length) return passagesHTML;
+        return passagesHTML.replace(/<div class="toeic-set" data-set="(\d+)">/g, function (whole, num) {
+            return labels[num] ? whole + '\n  <p class="qset-label">' + labels[num] + '</p>' : whole;
+        });
+    }
+
     /* =====================================================================
        PART 5 — Incomplete Sentences. No shared passage, so unlike Part 7
        there is no drift risk from writing and solving in one breath; this
@@ -2006,7 +2021,7 @@
                         var fm = renumber(mg.questions, mg.answers, mg.explanations, mCursor);
                         var em = ensureInputs(fm.questions, fm.answers);
                         mGroups[gt] = {
-                            label: mg.label, passages: mg.passages, questions: em.questions,
+                            label: mg.label, passages: injectPassageQLabels(mg.passages, em.questions), questions: em.questions,
                             answers: fm.answers, explanations: fm.explanations,
                             first: mCursor, last: mCursor + fm.count - 1
                         };
@@ -2023,7 +2038,7 @@
                         var fg = renumber(gres.questions, gres.answers, gres.explanations, cursor);
                         var eg = ensureInputs(fg.questions, fg.answers);
                         groups[gt] = {
-                            label: gInfo.label, passages: gres.passages, questions: eg.questions,
+                            label: gInfo.label, passages: injectPassageQLabels(gres.passages, eg.questions), questions: eg.questions,
                             answers: fg.answers, explanations: fg.explanations,
                             first: cursor, last: cursor + fg.count - 1
                         };
